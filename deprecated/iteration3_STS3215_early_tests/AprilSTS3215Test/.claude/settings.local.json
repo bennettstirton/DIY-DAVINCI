@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /Users/bennett/Downloads/STServo_Python/stservo-env/sms_sts/change_id.py)"
+    ]
+  }
+}
