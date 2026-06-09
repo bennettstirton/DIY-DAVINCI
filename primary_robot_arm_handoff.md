@@ -16,8 +16,8 @@ The three axes are:
 
 Control inputs:
 
-- **Main 2-axis analog joystick:** controls Pitch and Roll target angle via ADC on GPIO 35 (Pitch) and GPIO 34 (Roll). Note: pins are swapped from physical labelling — X wire → GPIO 35, Y wire → GPIO 34.
-- **Trim 2-axis analog joystick:** jogs Pitch and Roll home position via ADC on GPIO 32/33. Speed scales with deflection. Jogging updates the rotary home positions, changing where the arm returns when the main joystick is centred.
+- **MPU6050 IMU (main input):** controls Pitch and Roll target angle by tilting the handheld controller. Shares the I2C bus (GPIO 21/22) alongside the TCA9548A/AS5600 encoders. Replaced the original 2-axis analog joystick (GPIO 34/35), which was removed due to reliability issues. See §5.3 for IMU wiring and calibration notes.
+- **Trim 2-axis analog joystick:** jogs Pitch and Roll home position via ADC on GPIO 32/33. Speed scales with deflection. Jogging updates the rotary home positions, changing where the arm returns when the IMU is held at neutral.
 - **Optical quadrature encoder:** drives the linear axis. Rotating the encoder extends/retracts the end effector. Input on GPIO 16 (A) and 17 (B).
 
 ---
@@ -34,8 +34,8 @@ All 38 ESP32 pins are now fully committed. Do not reassign without a full audit.
 | 25 | Roll DIR (direction output to TB6600) |
 | 13 | Linear STEP (PWM output to TB6600) |
 | 15 | Linear DIR (direction output to TB6600) |
-| 35 | Main joystick — Pitch axis ADC (physically the X wire) — ADC-only pin |
-| 34 | Main joystick — Roll axis ADC (physically the Y wire) — ADC-only pin |
+| 35 | **Unused** (was main joystick Pitch ADC — joystick replaced by MPU6050 IMU) |
+| 34 | **Unused** (was main joystick Roll ADC — joystick replaced by MPU6050 IMU) |
 | 32 | Trim joystick — Pitch trim ADC |
 | 33 | Trim joystick — Roll trim ADC |
 | 16 | Optical encoder channel A (INPUT_PULLUP) |
@@ -43,8 +43,8 @@ All 38 ESP32 pins are now fully committed. Do not reassign without a full audit.
 | 18 | Unused (was Pitch rocker FWD) |
 | 19 | Unused (was Pitch rocker BWD) |
 | 23 | Linear limit switch (INPUT_PULLUP, normally closed — reads 0 at rest, 1 when triggered) |
-| 21 | TCA9548A I2C multiplexer SDA (single bus → both AS5600s) |
-| 22 | TCA9548A I2C multiplexer SCL |
+| 21 | I2C SDA — shared bus: TCA9548A (→ both AS5600s) + MPU6050 IMU |
+| 22 | I2C SCL — shared bus: TCA9548A (→ both AS5600s) + MPU6050 IMU |
 | 4  | E-stop button (NC, INPUT_PULLUP — open = triggered, fail-safe wiring) |
 | 5  | Re-arm button (NO, INPUT_PULLUP — press after releasing e-stop to resume) |
 | 2  | Onboard blue LED (OUTPUT — blinks 1Hz while armcontrol.py main loop is running) |
@@ -59,7 +59,7 @@ All 38 ESP32 pins are now fully committed. Do not reassign without a full audit.
 The main loop runs every 40ms (CONTROL_LOOP_MS). Each tick it evaluates three routing decisions:
 
 - **handle_jogging(trim_p, trim_r):** Called when the trim joystick is deflected on either axis, OR when either of those axes is still in its post-release decel ramp. Speed scales with trim deflection magnitude. On decel end, home is updated to `actual - joy_now * MAX_DEGREES` so the arm stays put when the main joystick is centred.
-- **handle_joystick(dt_ms):** Called when no rotary rocker is active and no rotary decel is in progress. Runs PID for both Pitch and Roll. Does nothing with the linear axis.
+- **handle_main_input(dt_ms):** Called when no rotary jog is active and no rotary decel is in progress. Reads the IMU, applies EMA smoothing, and runs PID for both Pitch and Roll. Does nothing with the linear axis.
 - **handle_linear():** Called EVERY TICK, unconditionally, after the jogging/joystick decision. This is critical — linear is fully independent of the rotary routing. It handles its own ramp, soft limits, and limit switch check.
 
 > ⚠ The linear axis was originally inside handle_jogging() but was extracted to handle_linear() to fix a bug where pressing the linear rocker during joystick mode caused continuous uncontrolled motion. Never merge it back into handle_jogging().
@@ -72,9 +72,9 @@ Each axis has a dedicated boolean flag (pitch_decelerating, roll_decelerating, l
 
 ## 3.3 PID Control (Pitch and Roll)
 
-Both rotary axes use a standard PID loop. The joystick value is multiplied by MAX_DEGREES and added to home_deg to produce a target angle. The encoder reads the actual angle. The error drives the PID, whose output is mapped to a PWM frequency and direction.
+Both rotary axes use a standard PID loop. The IMU tilt (normalised to [-1, +1] over IMU_PITCH/ROLL_MAX_TILT_DEG) is multiplied by MAX_DEGREES and added to home_deg to produce a target angle. The encoder reads the actual angle. The error drives the PID, whose output is mapped to a PWM frequency and direction.
 
-- **EMA smoothing is applied to the joystick read BEFORE the target angle is calculated.** This is essential — without it, ADC noise in the potentiometer gets multiplied by MAX_DEGREES and causes constant motor buzzing at rest. EMA_ALPHA = 0.2 is the current setting (lower = smoother/more sluggish, higher = more responsive/noisier).
+- **EMA smoothing is applied to the IMU read BEFORE the target angle is calculated.** This is essential — without it, accelerometer noise gets multiplied by MAX_DEGREES and causes constant motor buzzing at rest. EMA_ALPHA = 0.2 is the current setting (lower = smoother/more sluggish, higher = more responsive/noisier).
 - **Deadband:** If the error is within the deadband, the motor stops and the PID is skipped entirely (using an else block). This is important — early versions fell through the deadband check and ran the PID anyway, causing integral accumulation at rest.
 - **Integral clamp:** KI_CLAMP prevents integral windup. The integral is also reset to zero when the deadband is entered or when jogging ends.
 
@@ -148,7 +148,23 @@ The bus is configured at 100kHz.
 - **Ethernet cable warning:** Ethernet cable is not suitable for I2C over distance. Its high inter-conductor capacitance rounds signal edges. Use shielded twisted pair (STP) cable, or consider I2C bus extender chips (PCA9600, LTC4311) for runs longer than ~0.5m.
 - **Intermittent read failures:** Three Roll AS5600 read failures were observed in a single test session, likely vibration-induced contact issues on the cable to the TCA9548A. Each failure stops the roll motor for one tick. Check all connectors under the multiplexer if failures recur.
 
-## 5.3 PWM and Stepper Drivers
+## 5.3 MPU6050 IMU (Main Input)
+
+The MPU6050 (GY-521 breakout) replaced the analog joystick as the pitch/roll input on 2026-06-08. The original joystick was removed due to reliability and noise issues; the IMU provides gravity-referenced, non-drifting tilt angles.
+
+**Wiring:** VCC → 3.3V, GND → GND, SDA → GPIO 21, SCL → GPIO 22, AD0 → unconnected (defaults to address 0x68). XDA/XCL/INT unused.
+
+**I2C bus sharing:** The MPU6050 sits directly on the same bus as the TCA9548A (0x70). No mux needed — its address (0x68) doesn't collide with anything on the bus. The physical wires that previously carried the joystick analog signals (through the control station ethernet cable) now carry this I2C bus to the IMU.
+
+**Pull-up resistors:** 2.2kΩ–1kΩ pull-ups on SDA and SCL at the ESP32 end are recommended for the long cable run from control station to ESP32. The GY-521 has onboard 10kΩ pull-ups, but these are too weak over extended cable. Standard 100kHz bus speed.
+
+**How angle derivation works:** The code uses only the accelerometer — not the gyroscope. It computes pitch and roll from the gravity vector direction using `atan2`. This gives absolute, gravity-referenced angles that do not drift over time. The gyroscope is not used. During fast motion, accelerometer noise increases; the EMA filter (EMA_ALPHA) mitigates this.
+
+**Calibration:** A one-time calibration offset is baked into CONFIG (`IMU_PITCH_OFFSET_DEG`, `IMU_ROLL_OFFSET_DEG`). To re-measure: run armcontrolsetup.py Test D with zeroing skipped, note the raw readings at working-neutral mount position, and enter the corrections needed to bring them to 0. Current values: pitch 0.0°, roll -90.0° (the IMU's physical mount orientation produces ~+90° raw roll at neutral).
+
+**Control mapping:** IMU tilt is normalised to [-1, +1] over `IMU_PITCH/ROLL_MAX_TILT_DEG` (currently 30°), with a `IMU_DEADBAND_PITCH/ROLL_DEG` (currently 1.5°) deadband. The normalised value is then multiplied by `PITCH/ROLL_MAX_DEGREES` to produce the arm target angle — identical to how the old joystick worked.
+
+## 5.4 PWM and Stepper Drivers
 
 Motors are driven by toggling a PWM signal on the STEP pin. The duty cycle is fixed at 512/1023 (50%). Only the frequency changes to control motor speed. Direction is set via the DIR pin.
 
@@ -186,7 +202,7 @@ The linear axis is open-loop and rocker-only. The only parameters to tune are:
 ## 7.1 Working Well
 
 - Pitch and Roll closed-loop PID with encoder feedback
-- Main joystick control of Pitch and Roll with EMA smoothing
+- MPU6050 IMU tilt control of Pitch and Roll with EMA smoothing
 - Trim joystick jogging for Pitch and Roll with accel/decel ramps and home update
 - Optical encoder input driving linear axis position control
 - Linear homing routine with backoff and position zeroing; optional skip via BOOT button or keypress
@@ -213,8 +229,11 @@ The linear axis is open-loop and rocker-only. The only parameters to tune are:
 
 | Parameter | Notes |
 |-----------|-------|
-| EMA_ALPHA | Joystick smoothing. 0.2 currently. Lower = smoother, higher = more responsive. |
-| PITCH/ROLL_MAX_DEGREES | Joystick full deflection → this many degrees of target angle change. Currently 15.0. |
+| EMA_ALPHA | IMU input smoothing. 0.2 currently. Lower = smoother, higher = more responsive. |
+| IMU_PITCH/ROLL_OFFSET_DEG | One-time calibration offsets. Measured via armcontrolsetup.py Test D (run with zeroing skipped, record raw reading at working-neutral, enter correction). |
+| IMU_PITCH/ROLL_MAX_TILT_DEG | Physical tilt (degrees) that maps to full ±1.0 command — equivalent to joystick full deflection. Currently 30.0. |
+| IMU_DEADBAND_PITCH/ROLL_DEG | Tilt within this many degrees of neutral reads as zero. Currently 1.5. |
+| PITCH/ROLL_MAX_DEGREES | IMU full deflection → this many degrees of arm target angle change. Currently 15.0. |
 | PITCH/ROLL_KP/KI/KD | PID gains. ROLL_KP=50, PITCH_KP=50. See tuning guide. |
 | PITCH/ROLL_POSITION_DEADBAND_DEG | Dead zone around target angle. Motor stops and PID skips if error is within this band. |
 | ENCODER_SCALE | Gear ratio between optical encoder and linear stepper. 0.75 currently. |
@@ -233,14 +252,16 @@ for p in [pitch_pwm, roll_pwm, linear_pwm]: p.duty(0)
 ## 8.3 I2C Bus Scan (run at startup automatically)
 
 ```python
-# Scan the main bus — should return [0x70] for TCA9548A
+# Scan the main bus — should return [0x68, 0x70] (MPU6050 + TCA9548A)
 i2c.scan()
 # Scan each AS5600 through the mux
 tca_select(0); i2c.scan()   # Roll channel — should return [0x36]
 tca_select(1); i2c.scan()   # Pitch channel — should return [0x36]
 ```
 
-If scan returns empty list: check VCC→3.3V, GND→GND, SDA/SCL connections, magnet within ~3mm of AS5600 face, and try reducing I2C frequency or adding stronger pull-up resistors.
+If 0x68 (MPU6050) is missing: check VCC→3.3V, GND→GND, SDA/SCL to GPIO 21/22, pull-up resistors on long cable run.
+If 0x70 (TCA9548A) is missing: check its SDA/SCL connections and VCC.
+If AS5600 missing on a channel: check TCA9548A connector for vibration-induced contact issues.
 
 ## 8.4 Standalone Operation (boot.py)
 
