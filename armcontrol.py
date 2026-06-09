@@ -9,13 +9,16 @@
 #   - Linear Axis (Extend): NEMA ?? + TB6600 driver  (STEP/DIR)
 #                           Open-loop, cable-driven spool (20mm dia, 175mm travel)
 #                           + limit switch at home end (GPIO23, normally closed)
-#   - Main joystick: 2-axis analog (pitch + roll commands, via ADC)
+#   - Main input: MPU6050 IMU — tilt the controller to command pitch/roll.
+#                 Shares the AS5600 I2C bus (GPIO 21/22). Replaced the original
+#                 2-axis analog joystick (GPIO 34/35), which proved unreliable.
 #   - Trim joystick: 2-axis analog (pitch + roll home jog, via ADC, GPIO 32/33)
 #   - Optical quadrature encoder for linear axis
 #
 # Control logic:
 #   - Pitch + Roll: Closed-loop PID using AS5600 encoders.
-#                   Main joystick commands target angle. Trim joystick jogs and
+#                   IMU tilt (relative to a calibrated neutral) commands target
+#                   angle, same as the joystick did. Trim joystick jogs and
 #                   updates home position (speed scales with deflection magnitude).
 #   - Linear:       Open-loop, encoder-commanded. Rotating the optical encoder
 #                   drives the linear stepper at a scaled rate.
@@ -97,9 +100,29 @@ ROLL_DIR_PIN    = 25
 LINEAR_STEP_PIN = 13
 LINEAR_DIR_PIN  = 15
 
-# Joystick ADC pins (must be ADC-capable: 32–39 on ESP32)
-JOY_X_PIN = 35   # controls Pitch axis (physically the joystick Y wire)
-JOY_Y_PIN = 34   # controls Roll axis  (physically the joystick X wire)
+# Main input: MPU6050 IMU (replaces the 2-axis analog joystick formerly on
+# GPIO 34/35 — those wires now carry the IMU's SDA/SCL to the I2C bus below).
+# The IMU shares the existing AS5600/TCA9548A I2C bus (GPIO 21/22) — its
+# address (0x68) doesn't collide with the TCA9548A (0x70) or AS5600s (0x36,
+# selected behind the mux).
+IMU_ADDR = 0x68
+
+# One-time calibration offsets — measured with armcontrolsetup.py Test D
+# (run with zeroing skipped, note the raw reading at the working-neutral
+# mount position, enter the correction needed to bring it to 0).
+# calibrated_angle = raw_accel_angle + offset
+IMU_PITCH_OFFSET_DEG = 0.0
+IMU_ROLL_OFFSET_DEG  = -90.0
+
+# Physical tilt range (degrees from calibrated neutral) that maps to full
+# +/-1.0 command — i.e. the IMU equivalent of full joystick deflection.
+IMU_PITCH_MAX_TILT_DEG = 30.0
+IMU_ROLL_MAX_TILT_DEG  = 30.0
+
+# Tilt within this many degrees of neutral reads as zero (prevents jitter
+# at rest from being interpreted as a command).
+IMU_DEADBAND_PITCH_DEG = 1.5
+IMU_DEADBAND_ROLL_DEG  = 1.5
 
 # Trim joystick (replaces 4 rocker switches, freeing GPIO 18 and 19)
 # Wire X axis to GPIO 32, Y axis to GPIO 33 (both ADC1, safe for use).
@@ -153,15 +176,6 @@ LINEAR_POSITION_INVERT = True
 # Physical home offset. Jog to desired zero, note the printed angle, enter it here.
 ROLL_ENCODER_OFFSET_DEG  = 0.0
 PITCH_ENCODER_OFFSET_DEG = 0.0
-
-# --- Joystick calibration ---
-JOY_MIN      = 200
-JOY_MAX      = 3895
-JOY_CENTRE   = 2048   # KY-023 theoretical centre; tune if joystick drifts at rest
-JOY_DEADBAND_PITCH = 50    # was 250
-JOY_DEADBAND_ROLL = 50     # was 120
-
-
 
 # --- Position control scaling ---
 ROLL_MAX_DEGREES  = 15.0 # was 45.0
@@ -236,7 +250,7 @@ LINEAR_INVERT_DIR = True   # flip if extend/retract are physically backwards
 LINEAR_HOMING_RPS  = 0.1
 LINEAR_HOMING_FREQ = int(LINEAR_HOMING_RPS * LINEAR_STEPS_PER_REV)
 
-# --- Joystick EMA smoothing ---
+# --- IMU input EMA smoothing ---
 # Lower = smoother but more sluggish. Higher = more responsive but noisier.
 EMA_ALPHA = 0.2
 
@@ -257,11 +271,6 @@ pitch_pwm  = PWM(Pin(PITCH_STEP_PIN),  freq=1000, duty=0)
 roll_pwm   = PWM(Pin(ROLL_STEP_PIN),   freq=1000, duty=0)
 linear_pwm = PWM(Pin(LINEAR_STEP_PIN), freq=1000, duty=0)
 
-joy_x = ADC(Pin(JOY_X_PIN))
-joy_y = ADC(Pin(JOY_Y_PIN))
-joy_x.atten(ADC.ATTN_11DB)
-joy_y.atten(ADC.ATTN_11DB)
-
 trim_joy_x = ADC(Pin(TRIM_JOY_X_PIN))
 trim_joy_y = ADC(Pin(TRIM_JOY_Y_PIN))
 trim_joy_x.atten(ADC.ATTN_11DB)
@@ -279,7 +288,9 @@ linear_limit = Pin(LINEAR_LIMIT_PIN, Pin.IN, Pin.PULL_UP)
 estop_pin = Pin(ESTOP_PIN, Pin.IN, Pin.PULL_UP)
 rearm_pin = Pin(REARM_PIN, Pin.IN, Pin.PULL_UP)
 
-# Single I2C bus → TCA9548A → both AS5600s (GPIO 21/22)
+# Single I2C bus → TCA9548A → both AS5600s, plus the MPU6050 IMU (GPIO 21/22).
+# The IMU sits directly on the bus (not behind the mux) — its address (0x68)
+# doesn't collide with the TCA9548A (0x70) or the AS5600s (0x36, mux-selected).
 i2c = SoftI2C(sda=Pin(AS5600_SDA_PIN), scl=Pin(AS5600_SCL_PIN),
               freq=AS5600_I2C_FREQ)
 
@@ -435,6 +446,90 @@ def read_pitch_angle_deg():
 
 
 # =============================================================================
+# MPU6050 IMU — MAIN INPUT (replaces analog joystick)
+# =============================================================================
+#
+# The MPU6050 has no onboard sensor fusion — we derive pitch/roll directly
+# from the accelerometer's gravity vector (atan2 of the gravity components).
+# This is gravity-referenced (absolute, non-drifting) but noisy under fast
+# motion; the existing EMA smoothing in handle_main_input() handles that,
+# the same way it smoothed the joystick's ADC noise.
+#
+# Calibration offsets (IMU_PITCH_OFFSET_DEG / IMU_ROLL_OFFSET_DEG) correct for
+# the chip's mounting tilt so the working-neutral position reads ~0,0.
+# Measured using armcontrolsetup.py Test D — see CONFIG comments for procedure.
+
+_MPU_PWR_MGMT_1  = 0x6B
+_MPU_WHO_AM_I    = 0x75
+_MPU_ACCEL_OUT   = 0x3B   # 6 bytes: XH XL YH YL ZH ZL
+_MPU_ACCEL_SCALE = 16384.0  # counts per g at +/-2g (chip default range)
+
+
+def imu_init():
+    """Wake the MPU6050 from sleep. Returns True if found and initialised."""
+    try:
+        who = i2c.readfrom_mem(IMU_ADDR, _MPU_WHO_AM_I, 1)[0]
+        if who not in (0x68, 0x72):
+            return False
+        i2c.writeto_mem(IMU_ADDR, _MPU_PWR_MGMT_1, bytes([0x00]))
+        time.sleep_ms(100)
+        return True
+    except OSError:
+        return False
+
+
+def read_imu_angles():
+    """
+    Returns (pitch_deg, roll_deg), gravity-referenced and calibration-offset
+    so the working-neutral mount position reads ~(0, 0). Returns (None, None)
+    on read failure.
+    """
+    try:
+        data = i2c.readfrom_mem(IMU_ADDR, _MPU_ACCEL_OUT, 6)
+    except OSError:
+        return None, None
+
+    def s16(h, l):
+        v = (h << 8) | l
+        return v - 65536 if v >= 32768 else v
+
+    ax = s16(data[0], data[1]) / _MPU_ACCEL_SCALE
+    ay = s16(data[2], data[3]) / _MPU_ACCEL_SCALE
+    az = s16(data[4], data[5]) / _MPU_ACCEL_SCALE
+
+    pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az)) * 57.2958 + IMU_PITCH_OFFSET_DEG
+    roll  = math.atan2( ay, az) * 57.2958 + IMU_ROLL_OFFSET_DEG
+    return pitch, roll
+
+
+def read_pitch_imu():
+    """
+    Read IMU pitch tilt with deadband applied, normalised to [-1.0, +1.0]
+    over IMU_PITCH_MAX_TILT_DEG. Same contract as the old read_pitch_joystick():
+    callers (handle_main_input, handle_jogging, main) need no changes.
+    """
+    pitch, _ = read_imu_angles()
+    if pitch is None:
+        return 0.0
+    if abs(pitch) < IMU_DEADBAND_PITCH_DEG:
+        return 0.0
+    return max(-1.0, min(1.0, pitch / IMU_PITCH_MAX_TILT_DEG))
+
+
+def read_roll_imu():
+    """
+    Read IMU roll tilt with deadband applied, normalised to [-1.0, +1.0]
+    over IMU_ROLL_MAX_TILT_DEG. Same contract as the old read_roll_joystick().
+    """
+    _, roll = read_imu_angles()
+    if roll is None:
+        return 0.0
+    if abs(roll) < IMU_DEADBAND_ROLL_DEG:
+        return 0.0
+    return max(-1.0, min(1.0, roll / IMU_ROLL_MAX_TILT_DEG))
+
+
+# =============================================================================
 # LIMIT SWITCH HELPER
 # =============================================================================
 
@@ -489,40 +584,6 @@ def stop_linear_motor():
     global linear_pwm
     linear_pwm.deinit()
     linear_pwm = PWM(Pin(LINEAR_STEP_PIN), freq=1000, duty=0)
-
-
-# =============================================================================
-# JOYSTICK HELPERS
-# =============================================================================
-
-def read_pitch_joystick():
-    """
-    Read the pitch (X) joystick axis with deadband applied.
-    Averages 4 ADC samples to reduce noise.
-    Returns a normalised float in [-1.0, +1.0]; 0.0 within deadband.
-    """
-    raw = sum(joy_x.read() for _ in range(4)) // 4
-    if abs(raw - JOY_CENTRE) < JOY_DEADBAND_PITCH:
-        return 0.0
-    if raw > JOY_CENTRE:
-        return min(1.0,  (raw - JOY_CENTRE) / (JOY_MAX - JOY_CENTRE))
-    else:
-        return max(-1.0, (raw - JOY_CENTRE) / (JOY_CENTRE - JOY_MIN))
-
-
-def read_roll_joystick():
-    """
-    Read the roll (Y) joystick axis with a small deadband.
-    Averages 4 ADC samples to reduce noise.
-    Returns a normalised float in [-1.0, +1.0]; 0.0 within deadband.
-    """
-    raw = sum(joy_y.read() for _ in range(4)) // 4
-    if abs(raw - JOY_CENTRE) < JOY_DEADBAND_ROLL:
-        return 0.0
-    if raw > JOY_CENTRE:
-        return min(1.0,  (raw - JOY_CENTRE) / (JOY_MAX - JOY_CENTRE))
-    else:
-        return max(-1.0, (raw - JOY_CENTRE) / (JOY_CENTRE - JOY_MIN))
 
 
 # =============================================================================
@@ -679,7 +740,7 @@ def handle_jogging(trim_p, trim_r):
             pitch_pid_last_error = 0.0
             angle = read_pitch_angle_deg()
             if angle is not None:
-                joy_now          = read_pitch_joystick()
+                joy_now          = read_pitch_imu()
                 ema_joy_pitch    = joy_now
                 pitch_home_deg   = angle - (joy_now * PITCH_MAX_DEGREES)
                 pitch_target_deg = angle
@@ -716,7 +777,7 @@ def handle_jogging(trim_p, trim_r):
             roll_pid_last_error = 0.0
             angle = read_roll_angle_deg()
             if angle is not None:
-                joy_now             = read_roll_joystick()
+                joy_now             = read_roll_imu()
                 ema_joy_roll        = joy_now
                 roll_home_deg       = angle - (joy_now * ROLL_MAX_DEGREES)
                 roll_target_deg     = angle
@@ -902,7 +963,7 @@ def handle_encoder_linear():
 # JOYSTICK POSITION CONTROL
 # =============================================================================
 
-def handle_joystick(dt_ms):
+def handle_main_input(dt_ms):
     """
     Drive pitch and roll toward joystick-commanded targets using PID.
     Linear axis is encoder-only — nothing happens here for that axis.
@@ -914,8 +975,8 @@ def handle_joystick(dt_ms):
 
     dt_sec = max(dt_ms / 1000.0, 0.001)
 
-    ema_joy_pitch = EMA_ALPHA * read_pitch_joystick() + (1.0 - EMA_ALPHA) * ema_joy_pitch
-    ema_joy_roll  = EMA_ALPHA * read_roll_joystick()  + (1.0 - EMA_ALPHA) * ema_joy_roll
+    ema_joy_pitch = EMA_ALPHA * read_pitch_imu() + (1.0 - EMA_ALPHA) * ema_joy_pitch
+    ema_joy_roll  = EMA_ALPHA * read_roll_imu()  + (1.0 - EMA_ALPHA) * ema_joy_roll
 
     # -------------------------------------------------------------------------
     # PITCH — closed-loop PID
@@ -1053,15 +1114,20 @@ def main():
         print("Confirm magnet is within ~3mm of sensor face.")
         return
 
-    # --- Joystick centre (fixed — see JOY_CENTRE in config) ---
-    print("Joystick centre fixed at", JOY_CENTRE)
+    # --- IMU init ---
+    print("Initialising MPU6050 IMU...")
+    if not imu_init():
+        print("ERROR: MPU6050 not found at 0x{:02X}. Check SDA->GPIO21, SCL->GPIO22, VCC->3.3V.".format(IMU_ADDR))
+        return
+    print("  IMU ready. Pitch offset: {:.1f}deg  Roll offset: {:.1f}deg".format(
+        IMU_PITCH_OFFSET_DEG, IMU_ROLL_OFFSET_DEG))
 
     # --- Initialise rotary axis state ---
-    # Back-calculate home so that the joystick's current position produces
+    # Back-calculate home so that the IMU's current reading produces
     # zero error on the first tick — prevents the arm from lurching on startup
     # if the joystick is not perfectly centred.
-    initial_joy_roll  = read_roll_joystick()
-    initial_joy_pitch = read_pitch_joystick()
+    initial_joy_roll  = read_roll_imu()
+    initial_joy_pitch = read_pitch_imu()
 
     roll_home_deg        = initial_angle - (initial_joy_roll  * ROLL_MAX_DEGREES)
     roll_target_deg      = initial_angle
@@ -1109,7 +1175,7 @@ def main():
         home_linear_axis()
 
     print("")
-    print("Ready. Main joystick: pitch/roll. Trim joystick: jog home. Encoder: linear.\n")
+    print("Ready. Tilt IMU: pitch/roll. Trim joystick: jog home. Encoder: linear.\n")
 
     # --- Main control loop ---
     while True:
@@ -1138,12 +1204,12 @@ def main():
                     p_angle = read_pitch_angle_deg()
                     r_angle = read_roll_angle_deg()
                     if p_angle is not None:
-                        joy_now          = read_pitch_joystick()
+                        joy_now          = read_pitch_imu()
                         ema_joy_pitch    = joy_now
                         pitch_home_deg   = p_angle - (joy_now * PITCH_MAX_DEGREES)
                         pitch_target_deg = p_angle
                     if r_angle is not None:
-                        joy_now          = read_roll_joystick()
+                        joy_now          = read_roll_imu()
                         ema_joy_roll     = joy_now
                         roll_home_deg    = r_angle - (joy_now * ROLL_MAX_DEGREES)
                         roll_target_deg  = r_angle
@@ -1172,7 +1238,7 @@ def main():
         if any_jog_active:
             handle_jogging(trim_p, trim_r)
         else:
-            handle_joystick(dt_ms)
+            handle_main_input(dt_ms)
 
         handle_encoder_linear()   # always runs, independent of jog state
         _status_led.value((time.ticks_ms() // 1000) % 2)
