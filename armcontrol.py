@@ -240,6 +240,13 @@ PITCH_JOG_DECEL_HZ   = max(1, int(PITCH_JOG_DECEL_RPS2 * PITCH_STEPS_PER_REV * C
 LINEAR_ENC_DECEL_RPS2 = 4.0
 LINEAR_ENC_DECEL_HZ   = max(1, int(LINEAR_ENC_DECEL_RPS2 * LINEAR_STEPS_PER_REV * CONTROL_LOOP_SEC))
 
+# Minimum encoder counts per 40ms tick required to command linear motor motion.
+# Filters out single-count EMI noise induced by pitch/roll stepper drivers on
+# the encoder A/B wires. A real intentional input at even slow speed will
+# produce many counts per tick; a noise spike typically produces only 1-2.
+# Raise if phantom motion persists; lower if slow intentional inputs are ignored.
+LINEAR_ENC_MIN_DELTA = 8
+
 # --- Step direction polarity ---
 PITCH_INVERT_DIR  = False
 ROLL_INVERT_DIR   = False
@@ -891,7 +898,7 @@ def handle_encoder_linear():
     # (used for the position estimate below).
     steps_this_tick = int(linear_current_freq * CONTROL_LOOP_SEC)
 
-    if delta != 0 and error != 0:
+    if abs(delta) >= LINEAR_ENC_MIN_DELTA and error != 0:
         # ------------------------------------------------------------------
         # CASE A: Encoder is turning AND the arm has somewhere to go.
         # ------------------------------------------------------------------
