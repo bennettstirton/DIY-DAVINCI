@@ -249,6 +249,4 @@ DEMO_HOLD_MS = 1500
 # How long the orbit runs before the sequence restarts (ms).
 DEMO_ORBIT_DURATION_MS = 8000
 
-# Speed cap for demo moves — fraction of PITCH/ROLL_MAX_FREQ.
-# Lower = smoother and safer for filming; raise if moves look sluggish.
-DEMO_SPEED_FRACTION = 0.6
+# To slow the demo down for filming, lower PITCH_MAX_RPS / ROLL_MAX_RPS above.

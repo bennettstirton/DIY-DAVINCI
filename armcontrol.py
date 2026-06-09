@@ -743,29 +743,20 @@ def handle_encoder_linear():
 
 
 # =============================================================================
-# JOYSTICK POSITION CONTROL
+# PID EXECUTION (shared by normal and demo input paths)
 # =============================================================================
 
-def handle_main_input(dt_ms):
-    """
-    Drive pitch and roll toward joystick-commanded targets using PID.
-    Linear axis is encoder-only — nothing happens here for that axis.
-    """
-    global ema_joy_pitch, ema_joy_roll
+def _run_pid(dt_ms):
+    """Drive pitch and roll toward pitch_target_deg / roll_target_deg via PID."""
     global pitch_current_freq, roll_current_freq
-    global pitch_target_deg, pitch_home_deg, pitch_pid_integral, pitch_pid_last_error
-    global roll_target_deg, roll_home_deg, roll_pid_integral, roll_pid_last_error
+    global pitch_pid_integral, pitch_pid_last_error
+    global roll_pid_integral, roll_pid_last_error
 
     dt_sec = max(dt_ms / 1000.0, 0.001)
 
-    ema_joy_pitch = EMA_ALPHA * read_pitch_imu() + (1.0 - EMA_ALPHA) * ema_joy_pitch
-    ema_joy_roll  = EMA_ALPHA * read_roll_imu()  + (1.0 - EMA_ALPHA) * ema_joy_roll
-
     # -------------------------------------------------------------------------
-    # PITCH — closed-loop PID
+    # PITCH
     # -------------------------------------------------------------------------
-    pitch_target_deg = pitch_home_deg + (ema_joy_pitch * PITCH_MAX_DEGREES)
-
     actual_pitch = read_pitch_angle_deg()
     if actual_pitch is None:
         stop_motor(pitch_pwm)
@@ -797,13 +788,12 @@ def handle_main_input(dt_ms):
             stop_motor(pitch_pwm)
             pitch_current_freq = 0
         else:
-            pitch_current_freq = set_motor(pitch_pwm, pitch_dir, PITCH_INVERT_DIR, desired_freq_pitch, forward_pitch, prev_pitch)
+            pitch_current_freq = set_motor(pitch_pwm, pitch_dir, PITCH_INVERT_DIR,
+                                           desired_freq_pitch, forward_pitch, prev_pitch)
 
     # -------------------------------------------------------------------------
-    # ROLL — closed-loop PID
+    # ROLL
     # -------------------------------------------------------------------------
-    roll_target_deg = roll_home_deg + (ema_joy_roll * ROLL_MAX_DEGREES)
-
     actual_roll = read_roll_angle_deg()
     if actual_roll is None:
         stop_motor(roll_pwm)
@@ -835,9 +825,90 @@ def handle_main_input(dt_ms):
             stop_motor(roll_pwm)
             roll_current_freq = 0
         else:
-            roll_current_freq = set_motor(roll_pwm, roll_dir, ROLL_INVERT_DIR, desired_freq_roll, forward_roll, prev_roll)
+            roll_current_freq = set_motor(roll_pwm, roll_dir, ROLL_INVERT_DIR,
+                                          desired_freq_roll, forward_roll, prev_roll)
 
     debug_print(pitch_target_deg, actual_pitch, roll_target_deg, actual_roll)
+
+
+# =============================================================================
+# NORMAL INPUT PATH (IMU → targets → PID)
+# =============================================================================
+
+def handle_main_input(dt_ms):
+    global ema_joy_pitch, ema_joy_roll
+    global pitch_target_deg, roll_target_deg
+
+    ema_joy_pitch = EMA_ALPHA * read_pitch_imu() + (1.0 - EMA_ALPHA) * ema_joy_pitch
+    ema_joy_roll  = EMA_ALPHA * read_roll_imu()  + (1.0 - EMA_ALPHA) * ema_joy_roll
+
+    pitch_target_deg = pitch_home_deg + (ema_joy_pitch * PITCH_MAX_DEGREES)
+    roll_target_deg  = roll_home_deg  + (ema_joy_roll  * ROLL_MAX_DEGREES)
+
+    _run_pid(dt_ms)
+
+
+# =============================================================================
+# DEMO MODE — preprogrammed motion sequence
+# =============================================================================
+#
+# Sequence: pitch +/- sweep → roll +/- sweep → circular orbit → repeat.
+# The reference point is pitch_home_deg / roll_home_deg, which the arm sets
+# at startup from wherever it physically sits. Jog to the desired filming
+# position with the trim joystick BEFORE enabling DEMO_MODE in config.py.
+#
+# Orbit math: a parametric circle in pitch/roll space.
+#   pitch = home + radius * cos(ω * t)
+#   roll  = home + radius * sin(ω * t)
+# At t=0: pitch = home + radius, roll = home — exactly where the orbit-entry
+# phase (phase 8) already commanded, so the transition is seamless.
+
+_demo_phase          = 0
+_demo_phase_start_ms = 0
+
+# Each entry is (pitch_offset_deg, roll_offset_deg) from home, or None for orbit.
+_DEMO_PHASES = [
+    ( DEMO_PITCH_AMPLITUDE_DEG,  0.0),   # 0: pitch +
+    ( 0.0,                       0.0),   # 1: return home
+    (-DEMO_PITCH_AMPLITUDE_DEG,  0.0),   # 2: pitch -
+    ( 0.0,                       0.0),   # 3: return home
+    ( 0.0,  DEMO_ROLL_AMPLITUDE_DEG),    # 4: roll +
+    ( 0.0,                       0.0),   # 5: return home
+    ( 0.0, -DEMO_ROLL_AMPLITUDE_DEG),    # 6: roll -
+    ( 0.0,                       0.0),   # 7: return home
+    ( DEMO_ORBIT_RADIUS_DEG,     0.0),   # 8: orbit entry — settle at start point
+    None,                                # 9: circular orbit
+    ( 0.0,                       0.0),   # 10: return home
+]
+
+
+def handle_demo(dt_ms):
+    global pitch_target_deg, roll_target_deg
+    global _demo_phase, _demo_phase_start_ms
+
+    now            = time.ticks_ms()
+    elapsed        = time.ticks_diff(now, _demo_phase_start_ms)
+    phase_duration = DEMO_ORBIT_DURATION_MS if _demo_phase == 9 else DEMO_HOLD_MS
+
+    if elapsed >= phase_duration:
+        _demo_phase = (_demo_phase + 1) % len(_DEMO_PHASES)
+        _demo_phase_start_ms = now
+        elapsed = 0
+        if _demo_phase == 0:
+            print("Demo: restarting sequence.")
+
+    offsets = _DEMO_PHASES[_demo_phase]
+
+    if offsets is not None:
+        pitch_target_deg = pitch_home_deg + offsets[0]
+        roll_target_deg  = roll_home_deg  + offsets[1]
+    else:
+        t     = elapsed / 1000.0
+        omega = DEMO_ORBIT_RPS * 2.0 * math.pi
+        pitch_target_deg = pitch_home_deg + DEMO_ORBIT_RADIUS_DEG * math.cos(omega * t)
+        roll_target_deg  = roll_home_deg  + DEMO_ORBIT_RADIUS_DEG * math.sin(omega * t)
+
+    _run_pid(dt_ms)
 
 
 # =============================================================================
@@ -853,6 +924,7 @@ def main():
     global estop_active, estop_handled
     global pitch_current_freq, roll_current_freq, linear_current_freq
     global pitch_decelerating, roll_decelerating
+    global _demo_phase, _demo_phase_start_ms
 
     print("Scanning I2C bus...")
     devices = i2c.scan()
@@ -958,7 +1030,13 @@ def main():
         home_linear_axis()
 
     print("")
-    print("Ready. Tilt IMU: pitch/roll. Trim joystick: jog home. Encoder: linear.\n")
+    if DEMO_MODE:
+        print("{}DEMO MODE ACTIVE{} — running preprogrammed sequence.".format(BOLD, RESET))
+        print("Jog to filming position with trim joystick, then reset to start demo.\n")
+        _demo_phase          = 0
+        _demo_phase_start_ms = time.ticks_ms()
+    else:
+        print("Ready. Tilt IMU: pitch/roll. Trim joystick: jog home. Encoder: linear.\n")
 
     # --- Main control loop ---
     while True:
@@ -1012,16 +1090,19 @@ def main():
                 time.sleep_ms(sleep_ms)
             continue
 
-        trim_p = _read_trim(trim_joy_x, TRIM_JOY_INVERT_X)
-        trim_r = _read_trim(trim_joy_y, TRIM_JOY_INVERT_Y)
-
-        any_jog_active = (trim_p != 0.0 or trim_r != 0.0
-                          or pitch_decelerating or roll_decelerating)
-
-        if any_jog_active:
-            handle_jogging(trim_p, trim_r)
+        if DEMO_MODE:
+            handle_demo(dt_ms)
         else:
-            handle_main_input(dt_ms)
+            trim_p = _read_trim(trim_joy_x, TRIM_JOY_INVERT_X)
+            trim_r = _read_trim(trim_joy_y, TRIM_JOY_INVERT_Y)
+
+            any_jog_active = (trim_p != 0.0 or trim_r != 0.0
+                              or pitch_decelerating or roll_decelerating)
+
+            if any_jog_active:
+                handle_jogging(trim_p, trim_r)
+            else:
+                handle_main_input(dt_ms)
 
         handle_encoder_linear()   # always runs, independent of jog state
         _status_led.value((time.ticks_ms() // 1000) % 2)
