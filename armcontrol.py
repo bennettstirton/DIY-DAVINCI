@@ -174,9 +174,9 @@ def tca_select(channel):
     i2c.writeto(TCA9548A_ADDR, bytes([1 << channel]))
 
 
-def read_as5600_raw():
-    """Read the 12-bit raw angle (0-4095) from the roll AS5600. Returns None on failure."""
-    tca_select(ROLL_TCA_CHANNEL)
+def _read_as5600_raw(channel):
+    """Read the 12-bit raw angle (0-4095) from the AS5600 on the given TCA channel. Returns None on failure."""
+    tca_select(channel)
     for _ in range(3):
         try:
             data = i2c.readfrom_mem(AS5600_ADDR, AS5600_RAW_ANGLE_REG, 2)
@@ -187,12 +187,8 @@ def read_as5600_raw():
 
 
 def read_roll_angle_deg():
-    """
-    Read the roll joint angle in degrees, applying offset and invert.
-    Returns angle relative to ROLL_ENCODER_OFFSET_DEG, wrapped to [-180, +180].
-    Returns None on read failure.
-    """
-    raw = read_as5600_raw()
+    """Read roll joint angle in degrees, wrapped to [-180, +180]. Returns None on failure."""
+    raw = _read_as5600_raw(ROLL_TCA_CHANNEL)
     if raw is None:
         return None
     angle = (raw / 4096.0) * 360.0 - ROLL_ENCODER_OFFSET_DEG
@@ -203,21 +199,9 @@ def read_roll_angle_deg():
     return -angle if ROLL_ENCODER_INVERT else angle
 
 
-def read_pitch_as5600_raw():
-    """Read the 12-bit raw angle (0-4095) from the pitch AS5600. Returns None on failure."""
-    tca_select(PITCH_TCA_CHANNEL)
-    for _ in range(3):
-        try:
-            data = i2c.readfrom_mem(AS5600_ADDR, AS5600_RAW_ANGLE_REG, 2)
-            return ((data[0] & 0x0F) << 8) | data[1]
-        except OSError:
-            time.sleep_us(500)
-    return None
-
-
 def read_pitch_angle_deg():
-    """Read the pitch joint angle in degrees, wrapped to [-180, +180]. Returns None on failure."""
-    raw = read_pitch_as5600_raw()
+    """Read pitch joint angle in degrees, wrapped to [-180, +180]. Returns None on failure."""
+    raw = _read_as5600_raw(PITCH_TCA_CHANNEL)
     if raw is None:
         return None
     angle = (raw / 4096.0) * 360.0 - PITCH_ENCODER_OFFSET_DEG
@@ -285,31 +269,18 @@ def read_imu_angles():
     return pitch, roll
 
 
-def read_pitch_imu():
+def read_imu_commands():
     """
-    Read IMU pitch tilt with deadband applied, normalised to [-1.0, +1.0]
-    over IMU_PITCH_MAX_TILT_DEG. Same contract as the old read_pitch_joystick():
-    callers (handle_main_input, handle_jogging, main) need no changes.
+    Read both IMU axes in a single I2C transaction.
+    Returns (pitch_cmd, roll_cmd), each deadbanded and normalised to [-1.0, +1.0].
+    Returns (0.0, 0.0) on read failure.
     """
-    pitch, _ = read_imu_angles()
+    pitch, roll = read_imu_angles()
     if pitch is None:
-        return 0.0
-    if abs(pitch) < IMU_DEADBAND_PITCH_DEG:
-        return 0.0
-    return max(-1.0, min(1.0, pitch / IMU_PITCH_MAX_TILT_DEG))
-
-
-def read_roll_imu():
-    """
-    Read IMU roll tilt with deadband applied, normalised to [-1.0, +1.0]
-    over IMU_ROLL_MAX_TILT_DEG. Same contract as the old read_roll_joystick().
-    """
-    _, roll = read_imu_angles()
-    if roll is None:
-        return 0.0
-    if abs(roll) < IMU_DEADBAND_ROLL_DEG:
-        return 0.0
-    return max(-1.0, min(1.0, roll / IMU_ROLL_MAX_TILT_DEG))
+        return 0.0, 0.0
+    p = 0.0 if abs(pitch) < IMU_DEADBAND_PITCH_DEG else max(-1.0, min(1.0, pitch / IMU_PITCH_MAX_TILT_DEG))
+    r = 0.0 if abs(roll)  < IMU_DEADBAND_ROLL_DEG  else max(-1.0, min(1.0, roll  / IMU_ROLL_MAX_TILT_DEG))
+    return p, r
 
 
 # =============================================================================
@@ -523,7 +494,7 @@ def handle_jogging(trim_p, trim_r):
             pitch_pid_last_error = 0.0
             angle = read_pitch_angle_deg()
             if angle is not None:
-                joy_now          = read_pitch_imu()
+                joy_now, _       = read_imu_commands()
                 ema_joy_pitch    = joy_now
                 pitch_home_deg   = angle - (joy_now * PITCH_MAX_DEGREES)
                 pitch_target_deg = angle
@@ -560,7 +531,7 @@ def handle_jogging(trim_p, trim_r):
             roll_pid_last_error = 0.0
             angle = read_roll_angle_deg()
             if angle is not None:
-                joy_now             = read_roll_imu()
+                _, joy_now          = read_imu_commands()
                 ema_joy_roll        = joy_now
                 roll_home_deg       = angle - (joy_now * ROLL_MAX_DEGREES)
                 roll_target_deg     = angle
@@ -569,19 +540,6 @@ def handle_jogging(trim_p, trim_r):
             roll_current_freq = set_motor(roll_pwm, roll_dir, ROLL_INVERT_DIR,
                                           roll_current_freq, roll_last_forward, prev)
 
-    # -------------------------------------------------------------------------
-    # Home tracking (rotary axes only)
-    # -------------------------------------------------------------------------
-    #angle = read_pitch_angle_deg()
-    #if angle is not None:
-    #    pitch_home_deg   = angle
-    #    pitch_pid_last_error = pitch_target_deg - angle
-#
-    #angle = read_roll_angle_deg()
-    #if angle is not None:
-     #   roll_home_deg       = angle
-     #   roll_target_deg     = angle
-    #  roll_pid_last_error = roll_target_deg - angle
 
 
 # =============================================================================
@@ -839,8 +797,9 @@ def handle_main_input(dt_ms):
     global ema_joy_pitch, ema_joy_roll
     global pitch_target_deg, roll_target_deg
 
-    ema_joy_pitch = EMA_ALPHA * read_pitch_imu() + (1.0 - EMA_ALPHA) * ema_joy_pitch
-    ema_joy_roll  = EMA_ALPHA * read_roll_imu()  + (1.0 - EMA_ALPHA) * ema_joy_roll
+    _p, _r        = read_imu_commands()
+    ema_joy_pitch = EMA_ALPHA * _p + (1.0 - EMA_ALPHA) * ema_joy_pitch
+    ema_joy_roll  = EMA_ALPHA * _r + (1.0 - EMA_ALPHA) * ema_joy_roll
 
     pitch_target_deg = pitch_home_deg + (ema_joy_pitch * PITCH_MAX_DEGREES)
     roll_target_deg  = roll_home_deg  + (ema_joy_roll  * ROLL_MAX_DEGREES)
@@ -981,8 +940,7 @@ def main():
     # Back-calculate home so that the IMU's current reading produces
     # zero error on the first tick — prevents the arm from lurching on startup
     # if the joystick is not perfectly centred.
-    initial_joy_roll  = read_roll_imu()
-    initial_joy_pitch = read_pitch_imu()
+    initial_joy_pitch, initial_joy_roll = read_imu_commands()
 
     roll_home_deg        = initial_angle - (initial_joy_roll  * ROLL_MAX_DEGREES)
     roll_target_deg      = initial_angle
@@ -1064,15 +1022,14 @@ def main():
                     # Re-arm: snap PID state to current position so arm holds in place
                     p_angle = read_pitch_angle_deg()
                     r_angle = read_roll_angle_deg()
+                    _p, _r = read_imu_commands()
                     if p_angle is not None:
-                        joy_now          = read_pitch_imu()
-                        ema_joy_pitch    = joy_now
-                        pitch_home_deg   = p_angle - (joy_now * PITCH_MAX_DEGREES)
+                        ema_joy_pitch    = _p
+                        pitch_home_deg   = p_angle - (_p * PITCH_MAX_DEGREES)
                         pitch_target_deg = p_angle
                     if r_angle is not None:
-                        joy_now          = read_roll_imu()
-                        ema_joy_roll     = joy_now
-                        roll_home_deg    = r_angle - (joy_now * ROLL_MAX_DEGREES)
+                        ema_joy_roll     = _r
+                        roll_home_deg    = r_angle - (_r * ROLL_MAX_DEGREES)
                         roll_target_deg  = r_angle
                     pitch_pid_integral   = 0.0
                     pitch_pid_last_error = 0.0
