@@ -122,13 +122,14 @@ AS5600_I2C_FREQ      = 100000
 AS5600_ADDR          = 0x36
 AS5600_RAW_ANGLE_REG = 0x0C
 TCA9548A_ADDR        = 0x70
-ROLL_TCA_CHANNEL     = 0    # roll  AS5600 on TCA channel 0
-PITCH_TCA_CHANNEL    = 1    # pitch AS5600 on TCA channel 1
+ROLL_TCA_CHANNEL     = 0    # roll   AS5600 on TCA channel 0 (SC0/SD0)
+PITCH_TCA_CHANNEL    = 1    # pitch  AS5600 on TCA channel 1 (SC1/SD1)
+LINEAR_TCA_CHANNEL   = 2    # linear AS5600 on TCA channel 2 (SC2/SD2)
 
 # Flip to True if encoder reads increasing angles in the wrong direction.
 ROLL_ENCODER_INVERT   = False
 PITCH_ENCODER_INVERT  = False
-LINEAR_ENCODER_INVERT = False  # flip to True if extending input decreases encoder_position_steps
+LINEAR_ENCODER_INVERT = True   # AS5600 on NEMA17 shaft reads backwards — confirmed from log
 
 # Flip to True if the position counter moves in the wrong direction after
 # LINEAR_INVERT_DIR is already set correctly for motor direction.
@@ -231,7 +232,7 @@ EMA_ALPHA = 0.2
 # responding to the IMU. Jog to the desired home position with the trim
 # joystick before enabling, then reset the ESP32.
 
-DEMO_MODE = False
+DEMO_MODE = True
 
 # Degrees the arm travels in each direction for the axis sweep.
 DEMO_PITCH_AMPLITUDE_DEG = 10.0
@@ -244,9 +245,23 @@ DEMO_ORBIT_RADIUS_DEG = 10.0
 DEMO_ORBIT_RPS = 0.15
 
 # How long the arm dwells at each waypoint extreme before returning (ms).
-DEMO_HOLD_MS = 1500
+DEMO_HOLD_MS = 8000
+
+# Trim joystick speed when shifting the orbit center during demo mode.
+# Much slower than regular jog speeds — demo trim is for fine positioning.
+DEMO_TRIM_PITCH_RPS = 0.01   # ~3.6°/s max shift
+DEMO_TRIM_ROLL_RPS  = 0.05   # ~18°/s max shift
 
 # How long the orbit runs before the sequence restarts (ms).
-DEMO_ORBIT_DURATION_MS = 8000
+# MUST be a whole multiple of (1 / DEMO_ORBIT_RPS * 1000) to avoid a
+# discontinuous target jump at the phase wrap (up to 2×radius in one tick → PID slam).
+# At 0.15 Hz, period = 6667 ms → valid values: 6667, 13333, 20000, 26667, ...
+DEMO_ORBIT_DURATION_MS = 20000
+_orbit_period_ms = 1000.0 / DEMO_ORBIT_RPS
+assert abs(DEMO_ORBIT_DURATION_MS % _orbit_period_ms) < 50, (
+    "DEMO_ORBIT_DURATION_MS ({}) is not a whole multiple of orbit period ({:.0f} ms) "
+    "— this causes a discontinuous target jump at phase wrap.".format(
+        DEMO_ORBIT_DURATION_MS, _orbit_period_ms)
+)
 
 # To slow the demo down for filming, lower PITCH_MAX_RPS / ROLL_MAX_RPS above.
