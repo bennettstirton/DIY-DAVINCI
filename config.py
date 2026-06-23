@@ -99,9 +99,27 @@ TRIM_JOY_Y_PIN = 33   # controls Roll trim
 ENCODER_A_PIN = 16
 ENCODER_B_PIN = 17
 
-# Limit switch — wired between GPIO23 and GND (pull-up used, normally closed)
-# Triggered when the carriage reaches the home (fully retracted) end.
-LINEAR_LIMIT_PIN = 23
+# Limit/crash switches — moved off discrete GPIOs onto a Waveshare MCP23017
+# I2C GPIO expander (shares the existing AS5600/TCA9548A/MPU6050 I2C bus,
+# GPIO 21/22). Each switch is wired NC to GND, using the MCP's internal
+# pull-ups (no external resistors needed). GPIO23 (formerly LINEAR_LIMIT_PIN,
+# direct GPIO) is now free — INTA/INTB are unused/unwired, since the main
+# loop already polls the MCP every 40ms tick (see read_limit_switches() in
+# armcontrol.py), which is fast enough for mechanical limit switches.
+#
+# PA0 keeps the original linear-homing job: drive-to-switch during homing,
+# and an unlatched backstop during normal retract (auto-resyncs position,
+# same behavior as the old direct-GPIO LINEAR_LIMIT_PIN).
+# PA1-PA5 are new pure crash detectors — tripping one latches a per-axis
+# fault that halts only that axis until cleared via RE-ARM (see armcontrol.py).
+MCP23017_ADDR = 0x20   # A0/A1/A2 tied to GND
+
+MCP_LINEAR_HOME_BIT   = 0   # PA0 — linear retract/home limit (existing switch)
+MCP_LINEAR_EXTEND_BIT = 1   # PA1 — linear extend limit (new)
+MCP_PITCH_MIN_BIT     = 2   # PA2 — pitch min (new)
+MCP_PITCH_MAX_BIT     = 3   # PA3 — pitch max (new)
+MCP_ROLL_MIN_BIT      = 4   # PA4 — roll min (new)
+MCP_ROLL_MAX_BIT      = 5   # PA5 — roll max (new)
 
 # E-stop — NC (normally closed) button between GPIO4 and GND (pull-up used).
 # Normal: button closed → pin LOW.  E-stop pressed (or wire break): pin HIGH.
@@ -118,7 +136,11 @@ REARM_PIN = 5
 # Each AS5600 connects to its own TCA channel — no address collision.
 AS5600_SDA_PIN       = 21
 AS5600_SCL_PIN       = 22
-AS5600_I2C_FREQ      = 100000
+# 50 kHz (was 100 kHz): the encoder bus runs through a long multi-hop cable path,
+# so the extra rise-time margin improves reliability. We only read a couple of
+# registers at ~10-25 Hz, so the lower clock costs nothing. Drop to 10000 if
+# dropouts persist even with the 2.2k pull-ups.
+AS5600_I2C_FREQ      = 50000
 AS5600_ADDR          = 0x36
 AS5600_RAW_ANGLE_REG = 0x0C
 TCA9548A_ADDR        = 0x70
@@ -159,12 +181,16 @@ LINEAR_MAX_FREQ = int(LINEAR_MAX_RPS * LINEAR_STEPS_PER_REV)
 MIN_FREQ = 20
 
 # --- PID gains (rotary axes only — linear is open-loop) ---
-ROLL_KP       = 50.0
+ROLL_KP       = 200.0   # was 50 — 4x increase for orbit tracking; reduce if hold-mode oscillates
 ROLL_KI       = 5.0
 ROLL_KD       = 1.0
 ROLL_KI_CLAMP = 500.0
 
-PITCH_KP       = 50.0
+# Pitch is near-direct-drive (no gearbox), so it limit-cycles at high KP where
+# roll (10:1 gearbox) stays stable. KP=200 caused a ~0.46 Hz hold oscillation
+# (±5° hunting) — confirmed in log axis_20260616_080450. Backed off toward the
+# known-stable baseline of 50. Nudge up if hold feels sluggish, down if it hunts.
+PITCH_KP       = 60.0   # was 200 (oscillated), originally 50
 PITCH_KI       = 5.0
 PITCH_KD       = 3.0
 PITCH_KI_CLAMP = 500.0
@@ -252,16 +278,8 @@ DEMO_HOLD_MS = 8000
 DEMO_TRIM_PITCH_RPS = 0.01   # ~3.6°/s max shift
 DEMO_TRIM_ROLL_RPS  = 0.05   # ~18°/s max shift
 
-# How long the orbit runs before the sequence restarts (ms).
-# MUST be a whole multiple of (1 / DEMO_ORBIT_RPS * 1000) to avoid a
-# discontinuous target jump at the phase wrap (up to 2×radius in one tick → PID slam).
-# At 0.15 Hz, period = 6667 ms → valid values: 6667, 13333, 20000, 26667, ...
-DEMO_ORBIT_DURATION_MS = 20000
-_orbit_period_ms = 1000.0 / DEMO_ORBIT_RPS
-assert abs(DEMO_ORBIT_DURATION_MS % _orbit_period_ms) < 50, (
-    "DEMO_ORBIT_DURATION_MS ({}) is not a whole multiple of orbit period ({:.0f} ms) "
-    "— this causes a discontinuous target jump at phase wrap.".format(
-        DEMO_ORBIT_DURATION_MS, _orbit_period_ms)
-)
+# NOTE: The orbit is continuous — once it starts it loops on itself forever with
+# no restart, so there is no orbit "duration" to configure. (handle_demo enters
+# the orbit once after DEMO_HOLD_MS and never leaves it.)
 
 # To slow the demo down for filming, lower PITCH_MAX_RPS / ROLL_MAX_RPS above.

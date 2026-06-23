@@ -1,0 +1,161 @@
+<svg width="900" height="460" viewBox="0 0 900 460" xmlns="http://www.w3.org/2000/svg" font-family="monospace">
+  <defs>
+    <pattern id="holes" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="12" cy="12" r="2" fill="#888"/>
+    </pattern>
+  </defs>
+
+  <rect x="0" y="0" width="900" height="460" fill="#0d1117"/>
+  <text x="20" y="20" fill="#e6edf3" font-size="14" font-weight="bold">E-Stop / IC Gate — Perfboard Placement (one arm, 3 axes)</text>
+  <text x="20" y="36" fill="#8b949e" font-size="11">Grid = 0.1in (2.54mm) hole spacing. Columns 1-24 left-right, rows A-N top-bottom. Coordinates match estop_ic_perfboard_layout.md table.</text>
+
+  <!-- perfboard hole field -->
+  <rect x="128" y="58" width="576" height="336" fill="#142028" stroke="#30363d"/>
+  <rect x="128" y="58" width="576" height="336" fill="url(#holes)"/>
+
+  <!-- column headers 1-24 at top -->
+  <g fill="#6e7681" font-size="9" text-anchor="middle">
+    <text x="140" y="50">1</text><text x="164" y="50">2</text><text x="188" y="50">3</text>
+    <text x="212" y="50">4</text><text x="236" y="50">5</text><text x="260" y="50">6</text>
+    <text x="284" y="50">7</text><text x="308" y="50">8</text><text x="332" y="50">9</text>
+    <text x="356" y="50">10</text><text x="380" y="50">11</text><text x="404" y="50">12</text>
+    <text x="428" y="50">13</text><text x="452" y="50">14</text><text x="476" y="50">15</text>
+    <text x="500" y="50">16</text><text x="524" y="50">17</text><text x="548" y="50">18</text>
+    <text x="572" y="50">19</text><text x="596" y="50">20</text><text x="620" y="50">21</text>
+    <text x="644" y="50">22</text><text x="668" y="50">23</text><text x="692" y="50">24</text>
+  </g>
+  <!-- row headers A-N at left -->
+  <g fill="#6e7681" font-size="9" text-anchor="middle">
+    <text x="116" y="74">A</text><text x="116" y="98">B</text><text x="116" y="122">C</text>
+    <text x="116" y="146">D</text><text x="116" y="170">E</text><text x="116" y="194">F</text>
+    <text x="116" y="218">G</text><text x="116" y="242">H</text><text x="116" y="266">I</text>
+    <text x="116" y="290">J</text><text x="116" y="314">K</text><text x="116" y="338">L</text>
+    <text x="116" y="362">M</text><text x="116" y="386">N</text>
+  </g>
+
+  <!-- rails -->
+  <line x1="140" y1="70" x2="692" y2="70" stroke="#f85149" stroke-width="3"/>
+  <text x="700" y="74" fill="#f85149" font-size="11">3V3 RAIL (row A)</text>
+  <line x1="140" y1="382" x2="692" y2="382" stroke="#58a6ff" stroke-width="3"/>
+  <text x="700" y="386" fill="#58a6ff" font-size="11">GND RAIL (row N)</text>
+
+  <!-- IC1 74HC04 body -->
+  <rect x="202" y="132" width="164" height="92" fill="#21262d" stroke="#e6edf3" stroke-width="1.5"/>
+  <circle cx="210" cy="140" r="4" fill="none" stroke="#e6edf3"/>
+  <text x="284" y="183" fill="#e6edf3" font-size="12" text-anchor="middle">U1</text>
+  <text x="284" y="197" fill="#8b949e" font-size="10" text-anchor="middle">74HC04</text>
+
+  <!-- IC2 74HC08 body -->
+  <rect x="442" y="132" width="164" height="92" fill="#21262d" stroke="#e6edf3" stroke-width="1.5"/>
+  <circle cx="450" cy="140" r="4" fill="none" stroke="#e6edf3"/>
+  <text x="524" y="183" fill="#e6edf3" font-size="12" text-anchor="middle">U2</text>
+  <text x="524" y="197" fill="#8b949e" font-size="10" text-anchor="middle">74HC08</text>
+
+  <!-- IC1 pins (row D top, row G bottom) -->
+  <g fill="#ffd33d">
+    <circle cx="212" cy="142" r="3"/><circle cx="236" cy="142" r="3"/><circle cx="260" cy="142" r="3"/>
+    <circle cx="284" cy="142" r="3"/><circle cx="308" cy="142" r="3"/><circle cx="332" cy="142" r="3"/>
+    <circle cx="356" cy="142" r="3"/>
+    <circle cx="212" cy="214" r="3"/><circle cx="236" cy="214" r="3"/><circle cx="260" cy="214" r="3"/>
+    <circle cx="284" cy="214" r="3"/><circle cx="308" cy="214" r="3"/><circle cx="332" cy="214" r="3"/>
+    <circle cx="356" cy="214" r="3"/>
+  </g>
+  <g fill="#ffd33d" font-size="8" text-anchor="middle">
+    <text x="212" y="132">1</text><text x="236" y="132">2</text><text x="260" y="132">3</text>
+    <text x="284" y="132">4</text><text x="308" y="132">5</text><text x="332" y="132">6</text>
+    <text x="356" y="132">7</text>
+    <text x="212" y="228">14</text><text x="236" y="228">13</text><text x="260" y="228">12</text>
+    <text x="284" y="228">11</text><text x="308" y="228">10</text><text x="332" y="228">9</text>
+    <text x="356" y="228">8</text>
+  </g>
+
+  <!-- IC2 pins -->
+  <g fill="#79c0ff">
+    <circle cx="452" cy="142" r="3"/><circle cx="476" cy="142" r="3"/><circle cx="500" cy="142" r="3"/>
+    <circle cx="524" cy="142" r="3"/><circle cx="548" cy="142" r="3"/><circle cx="572" cy="142" r="3"/>
+    <circle cx="596" cy="142" r="3"/>
+    <circle cx="452" cy="214" r="3"/><circle cx="476" cy="214" r="3"/><circle cx="500" cy="214" r="3"/>
+    <circle cx="524" cy="214" r="3"/><circle cx="548" cy="214" r="3"/><circle cx="572" cy="214" r="3"/>
+    <circle cx="596" cy="214" r="3"/>
+  </g>
+  <g fill="#79c0ff" font-size="8" text-anchor="middle">
+    <text x="452" y="132">1</text><text x="476" y="132">2</text><text x="500" y="132">3</text>
+    <text x="524" y="132">4</text><text x="548" y="132">5</text><text x="572" y="132">6</text>
+    <text x="596" y="132">7</text>
+    <text x="452" y="228">14</text><text x="476" y="228">13</text><text x="500" y="228">12</text>
+    <text x="524" y="228">11</text><text x="548" y="228">10</text><text x="572" y="228">9</text>
+    <text x="596" y="228">8</text>
+  </g>
+
+  <!-- junction J1 -->
+  <circle cx="164" cy="118" r="4" fill="none" stroke="#d2a8ff" stroke-width="2"/>
+  <text x="170" y="112" fill="#d2a8ff" font-size="9">J1</text>
+
+  <!-- optional pull-up resistor -->
+  <path d="M164,118 L164,108 L160,104 L168,100 L160,96 L168,92 L164,88 L164,70" fill="none" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="2,2"/>
+  <text x="178" y="92" fill="#8b949e" font-size="9">10k (opt)</text>
+
+  <!-- wire: J1 to IC1 pin1 -->
+  <line x1="164" y1="118" x2="212" y2="142" stroke="#d2a8ff" stroke-width="2"/>
+
+  <!-- IC1 power wires -->
+  <line x1="212" y1="214" x2="212" y2="70" stroke="#f85149" stroke-width="2"/>
+  <line x1="356" y1="142" x2="356" y2="382" stroke="#58a6ff" stroke-width="2"/>
+
+  <!-- IC1 unused-input ties -->
+  <line x1="260" y1="142" x2="356" y2="142" stroke="#58a6ff" stroke-width="1.5"/>
+  <line x1="308" y1="142" x2="356" y2="142" stroke="#58a6ff" stroke-width="1.5"/>
+  <line x1="332" y1="214" x2="332" y2="382" stroke="#58a6ff" stroke-width="1.5"/>
+  <line x1="284" y1="214" x2="284" y2="382" stroke="#58a6ff" stroke-width="1.5"/>
+  <line x1="236" y1="214" x2="236" y2="382" stroke="#58a6ff" stroke-width="1.5"/>
+
+  <!-- IC2 power wires -->
+  <line x1="452" y1="214" x2="452" y2="70" stroke="#f85149" stroke-width="2"/>
+  <line x1="596" y1="142" x2="596" y2="382" stroke="#58a6ff" stroke-width="2"/>
+  <line x1="500" y1="214" x2="500" y2="382" stroke="#58a6ff" stroke-width="1.5"/>
+  <line x1="476" y1="214" x2="476" y2="382" stroke="#58a6ff" stroke-width="1.5"/>
+
+  <!-- ESTOP bus: IC1 pin2 -> IC2 pin2(1B), pin5(2B), pin10(3B) -->
+  <path d="M236,142 L236,124 L548,124" fill="none" stroke="#d2a8ff" stroke-width="2"/>
+  <line x1="476" y1="124" x2="476" y2="142" stroke="#d2a8ff" stroke-width="2"/>
+  <line x1="548" y1="124" x2="548" y2="214" stroke="#d2a8ff" stroke-width="2"/>
+  <text x="400" y="118" fill="#d2a8ff" font-size="9">ESTOP bus (HIGH=running)</text>
+
+  <!-- external lead labels: inputs above row D -->
+  <g font-size="9">
+    <text x="452" y="106" fill="#a5d6ff" text-anchor="middle">GPIO14</text>
+    <line x1="452" y1="110" x2="452" y2="142" stroke="#a5d6ff" stroke-dasharray="3,2"/>
+    <text x="524" y="106" fill="#a5d6ff" text-anchor="middle">GPIO26</text>
+    <line x1="524" y1="110" x2="524" y2="142" stroke="#a5d6ff" stroke-dasharray="3,2"/>
+  </g>
+  <text x="160" y="100" fill="#d2a8ff" font-size="8">E-STOP B /</text>
+  <text x="160" y="108" fill="#d2a8ff" font-size="8">GPIO4 (existing)</text>
+
+  <!-- bottom-row external connections -->
+  <g font-size="9">
+    <line x1="572" y1="214" x2="572" y2="250" stroke="#a5d6ff" stroke-dasharray="3,2"/>
+    <text x="572" y="262" fill="#a5d6ff" text-anchor="middle">GPIO13</text>
+  </g>
+
+  <!-- E-stop terminal A to GND -->
+  <line x1="188" y1="382" x2="188" y2="400" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <text x="188" y="412" fill="#58a6ff" font-size="9" text-anchor="middle">E-STOP Term A</text>
+
+  <!-- right-side output labels -->
+  <g font-size="9" fill="#ffa657">
+    <line x1="500" y1="142" x2="710" y2="78" stroke="#ffa657" stroke-dasharray="3,2"/>
+    <text x="714" y="80">DM556T STEP (Pitch)</text>
+    <line x1="572" y1="142" x2="710" y2="98" stroke="#ffa657" stroke-dasharray="3,2"/>
+    <text x="714" y="100">TB6600 STEP (Roll)</text>
+    <line x1="596" y1="214" x2="710" y2="118" stroke="#ffa657" stroke-dasharray="3,2"/>
+    <text x="714" y="120">TB6600 STEP (Linear)</text>
+  </g>
+
+  <!-- supply leads -->
+  <text x="40" y="74" fill="#f85149" font-size="9">3V3 SUPPLY</text>
+  <line x1="90" y1="70" x2="140" y2="70" stroke="#f85149" stroke-dasharray="3,2"/>
+  <text x="40" y="386" fill="#58a6ff" font-size="9">GND SUPPLY</text>
+  <line x1="100" y1="382" x2="140" y2="382" stroke="#58a6ff" stroke-dasharray="3,2"/>
+
+  <text x="20" y="440" fill="#6e7681" font-size="10">Legend: red=3V3, blue=GND, purple=ESTOP_N/ESTOP bus, dashed=off-board lead (not a board trace). Full hole-by-hole table in estop_ic_perfboard_layout.md</text>
+</svg>

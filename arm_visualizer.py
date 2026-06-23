@@ -40,7 +40,7 @@ import time
 import math
 import sys
 import matplotlib
-matplotlib.use('MacOSX')  # TkAgg unavailable on Python 3.14 without Tk; MacOSX backend works natively
+matplotlib.use('TkAgg')   # works on Mac; change to 'Qt5Agg' if TkAgg fails
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (activates 3D projection)
@@ -263,7 +263,7 @@ def update(frame):
             line_roll_tgt, line_roll_act, pt_ext_tgt, pt_arm_act)
 
 
-ani = animation.FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)  # 20 Hz
+ani = animation.FuncAnimation(fig, update, interval=50, blit=False)  # 20 Hz
 
 # =============================================================================
 # MAIN

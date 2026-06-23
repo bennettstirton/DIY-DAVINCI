@@ -11,7 +11,10 @@
       "WebFetch(domain:www.waveshare.com)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:www.feetechrc.com)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(qlmanage -t -s 1560 -o /tmp esp32_arm_wiring.svg)",
+      "Bash(python3 -c \"from PIL import Image; im=Image.open\\('/tmp/esp32_arm_wiring.svg.png'\\); print\\('size',im.size\\); im.crop\\(\\(760,0,1560,1100\\)\\).save\\('/tmp/right_half.png'\\)\")"
     ]
   }
 }

@@ -30,13 +30,13 @@
 #   - All tunable parameters are in the CONFIG section below.
 # =============================================================================
 
-from machine import Pin, ADC, PWM, SoftI2C
+from machine import Pin, ADC, PWM, SoftI2C, disable_irq, enable_irq
 import math
 import time
 import sys
 import select
-import micropython
 from config import *
+from mcp23017 import MCP23017
 
 BOLD  = "\033[1m"
 RESET = "\033[0m"
@@ -64,9 +64,6 @@ trim_joy_y.atten(ADC.ATTN_11DB)
 encoder_a = Pin(ENCODER_A_PIN, Pin.IN, Pin.PULL_UP)
 encoder_b = Pin(ENCODER_B_PIN, Pin.IN, Pin.PULL_UP)
 
-# Limit switch: normally closed (reads 1 at rest, drops to 0 when carriage opens it)
-linear_limit = Pin(LINEAR_LIMIT_PIN, Pin.IN, Pin.PULL_UP)
-
 # E-stop: normally closed button pulls pin LOW at rest; opening (press or wire break)
 # lets pull-up take it HIGH, triggering the ISR.
 estop_pin = Pin(ESTOP_PIN, Pin.IN, Pin.PULL_UP)
@@ -77,6 +74,12 @@ rearm_pin = Pin(REARM_PIN, Pin.IN, Pin.PULL_UP)
 # doesn't collide with the TCA9548A (0x70) or the AS5600s (0x36, mux-selected).
 i2c = SoftI2C(sda=Pin(AS5600_SDA_PIN), scl=Pin(AS5600_SCL_PIN),
               freq=AS5600_I2C_FREQ)
+
+# Limit/crash switches — MCP23017 GPIO expander on the same I2C bus (see config.py
+# for the PAx bit map). INTA/INTB are left unconnected: read_limit_switches()
+# polls mcp.read_gpio() once every 40ms tick regardless, which is already fast
+# enough for mechanical limit switches, so there's no wiring or ISR to add.
+mcp = MCP23017(i2c, MCP23017_ADDR)
 
 # =============================================================================
 # OPTICAL ENCODER STATE + INTERRUPT HANDLER
@@ -130,18 +133,120 @@ def _estop_isr(_):
 estop_pin.irq(trigger=Pin.IRQ_RISING, handler=_estop_isr)
 
 # =============================================================================
+# AXIS LIMIT / CRASH SWITCHES (MCP23017)
+# =============================================================================
+#
+# PA0 (linear home) is read every tick but is NOT a latched fault — it's the
+# existing homing reference / retract backstop, which already auto-resyncs
+# position in handle_encoder_linear() and home_linear_axis(). PA1-PA5 are new
+# crash detectors: tripping one latches axis_fault[...] = True, which halts
+# only that axis (PID/jog/encoder-drive) until RE-ARM clears it.
+
+axis_fault = {"pitch": False, "roll": False, "linear": False}
+
+
+def read_limit_switches():
+    """Poll the MCP23017 once this tick and latch any new crash-switch trips.
+    Call once per main-loop iteration, before the drive functions run.
+
+    While a fault is latched, this also forces that axis's current_freq/
+    decelerating state to zero every tick — not just on the initial trip —
+    so the jog/PID decel ramps in handle_jogging()/_run_pid() can't re-energize
+    the PWM at a decaying frequency after stop_motor() already silenced it."""
+    global pitch_current_freq, roll_current_freq, linear_current_freq
+    global pitch_decelerating, roll_decelerating, linear_decelerating
+    _mcp_bits = mcp.read_gpio()
+
+    if (_mcp_bits >> MCP_LINEAR_EXTEND_BIT) & 1 and not axis_fault["linear"]:
+        axis_fault["linear"] = True
+        print("!!! LINEAR EXTEND LIMIT TRIPPED — linear axis halted. Press RE-ARM to clear. !!!")
+    if (_mcp_bits >> MCP_PITCH_MIN_BIT) & 1 and not axis_fault["pitch"]:
+        axis_fault["pitch"] = True
+        print("!!! PITCH MIN LIMIT TRIPPED — pitch axis halted. Press RE-ARM to clear. !!!")
+    if (_mcp_bits >> MCP_PITCH_MAX_BIT) & 1 and not axis_fault["pitch"]:
+        axis_fault["pitch"] = True
+        print("!!! PITCH MAX LIMIT TRIPPED — pitch axis halted. Press RE-ARM to clear. !!!")
+    if (_mcp_bits >> MCP_ROLL_MIN_BIT) & 1 and not axis_fault["roll"]:
+        axis_fault["roll"] = True
+        print("!!! ROLL MIN LIMIT TRIPPED — roll axis halted. Press RE-ARM to clear. !!!")
+    if (_mcp_bits >> MCP_ROLL_MAX_BIT) & 1 and not axis_fault["roll"]:
+        axis_fault["roll"] = True
+        print("!!! ROLL MAX LIMIT TRIPPED — roll axis halted. Press RE-ARM to clear. !!!")
+
+    if axis_fault["pitch"]:
+        stop_motor(pitch_pwm)
+        pitch_current_freq = 0
+        pitch_decelerating = False
+    if axis_fault["roll"]:
+        stop_motor(roll_pwm)
+        roll_current_freq = 0
+        roll_decelerating = False
+    if axis_fault["linear"]:
+        stop_linear_motor()
+        linear_current_freq = 0
+        linear_decelerating = False
+
+
+def clear_axis_faults():
+    """Clear latched crash-switch faults and resync PID/jog state for the
+    axes that were faulted, same pattern as the e-stop RE-ARM resync."""
+    global pitch_target_deg, pitch_home_deg, ema_joy_pitch
+    global pitch_pid_integral, pitch_pid_last_error, pitch_pid_last_actual, pitch_current_freq, pitch_decelerating
+    global roll_target_deg, roll_home_deg, ema_joy_roll
+    global roll_pid_integral, roll_pid_last_error, roll_pid_last_actual, roll_current_freq, roll_decelerating
+    global linear_current_freq, linear_decelerating
+
+    if axis_fault["pitch"]:
+        p_angle = read_pitch_angle_deg()
+        _p, _ = read_imu_commands()
+        if p_angle is not None:
+            ema_joy_pitch         = _p
+            pitch_home_deg        = p_angle - (_p * PITCH_MAX_DEGREES)
+            pitch_target_deg      = p_angle
+            pitch_pid_last_error  = 0.0
+            pitch_pid_last_actual = None
+        pitch_pid_integral = 0.0
+        pitch_current_freq = 0
+        pitch_decelerating = False
+        axis_fault["pitch"] = False
+
+    if axis_fault["roll"]:
+        r_angle = read_roll_angle_deg()
+        _, _r = read_imu_commands()
+        if r_angle is not None:
+            ema_joy_roll          = _r
+            roll_home_deg         = r_angle - (_r * ROLL_MAX_DEGREES)
+            roll_target_deg       = r_angle
+            roll_pid_last_error   = 0.0
+            roll_pid_last_actual  = None
+        roll_pid_integral = 0.0
+        roll_current_freq = 0
+        roll_decelerating = False
+        axis_fault["roll"] = False
+
+    if axis_fault["linear"]:
+        linear_current_freq = 0
+        linear_decelerating = False
+        axis_fault["linear"] = False
+
+    print("RE-ARM — axis fault(s) cleared. Resuming.")
+
+
+# =============================================================================
 # STATE
 # =============================================================================
 
 pitch_home_deg       = 0.0
 pitch_target_deg     = 0.0
-pitch_pid_integral   = 0.0
-pitch_pid_last_error = 0.0
+pitch_pid_integral    = 0.0
+pitch_pid_last_error  = 0.0
+pitch_pid_last_actual = None   # None = skip D-term on first call / after reset
 
-roll_home_deg       = 0.0
-roll_target_deg     = 0.0
-roll_pid_integral   = 0.0
-roll_pid_last_error = 0.0
+roll_home_deg        = 0.0
+roll_target_deg      = 0.0
+roll_pid_integral    = 0.0
+roll_pid_last_error  = 0.0
+roll_pid_last_actual = None    # None = skip D-term on first call / after reset
 
 ema_joy_pitch = 0.0
 ema_joy_roll  = 0.0
@@ -157,6 +262,11 @@ linear_last_forward = True
 pitch_decelerating  = False
 roll_decelerating   = False
 linear_decelerating = False
+
+# Last trim joystick readings — updated by handle_demo(); zero otherwise.
+# Included in debug_print so the visualizer can display joystick drift.
+_last_trim_p = 0.0
+_last_trim_r = 0.0
 
 # Open-loop position counter for linear axis (in steps from home).
 # Positive = extended away from home.
@@ -174,6 +284,7 @@ _linear_as5600_fail_count = 0     # consecutive I2C read failures; resets prev o
 _linear_actual_mm        = None   # updated every tick by update_linear_encoder_mm()
 
 debug_last_print_ms = 0
+input_debug_last_ms = 0
 last_tick_ms = time.ticks_ms()
 
 # =============================================================================
@@ -352,8 +463,11 @@ def read_imu_commands():
 # =============================================================================
 
 def limit_switch_triggered():
-    """Return True if the normally-closed limit switch is triggered (circuit opened = reads 1)."""
-    return linear_limit.value() == 1
+    """Return True if the linear home/retract limit switch is triggered.
+    Does its own live I2C read (rather than using the read_limit_switches() cache)
+    since home_linear_axis() polls this from a tight blocking loop outside the
+    normal 40ms tick cadence."""
+    return (mcp.read_porta() >> MCP_LINEAR_HOME_BIT) & 1 == 1
 
 
 # =============================================================================
@@ -535,14 +649,16 @@ def handle_jogging(trim_p, trim_r):
     global pitch_home_deg, roll_home_deg, roll_target_deg, pitch_target_deg
     global pitch_current_freq, roll_current_freq
     global pitch_last_forward, roll_last_forward
-    global roll_pid_integral, roll_pid_last_error
-    global pitch_pid_integral, pitch_pid_last_error
+    global roll_pid_integral, roll_pid_last_error, roll_pid_last_actual
+    global pitch_pid_integral, pitch_pid_last_error, pitch_pid_last_actual
     global ema_joy_roll, ema_joy_pitch
     global pitch_decelerating, roll_decelerating
 
     # -------------------------------------------------------------------------
     # PITCH
     # -------------------------------------------------------------------------
+    if axis_fault["pitch"]:
+        trim_p = 0.0
     # Clamp to MIN_FREQ+1 so the motor actually runs at low deflections.
     # (PITCH_JOG_FREQ = 32 Hz; without this, deflections <62% fall below MIN_FREQ and stop.)
     pitch_target_freq = max(MIN_FREQ + 1, int(abs(trim_p) * PITCH_JOG_FREQ)) if abs(trim_p) > 0 else 0
@@ -567,8 +683,9 @@ def handle_jogging(trim_p, trim_r):
             pitch_current_freq = 0
             pitch_decelerating = False
             stop_motor(pitch_pwm)
-            pitch_pid_integral   = 0.0
-            pitch_pid_last_error = 0.0
+            pitch_pid_integral    = 0.0
+            pitch_pid_last_error  = 0.0
+            pitch_pid_last_actual = None
             angle = read_pitch_angle_deg()
             if angle is not None:
                 joy_now, _       = read_imu_commands()
@@ -582,6 +699,8 @@ def handle_jogging(trim_p, trim_r):
     # -------------------------------------------------------------------------
     # ROLL
     # -------------------------------------------------------------------------
+    if axis_fault["roll"]:
+        trim_r = 0.0
     roll_target_freq = max(MIN_FREQ + 1, int(abs(trim_r) * ROLL_JOG_FREQ)) if abs(trim_r) > 0 else 0
     trim_r_fwd = trim_r > 0
 
@@ -604,15 +723,15 @@ def handle_jogging(trim_p, trim_r):
             roll_current_freq = 0
             roll_decelerating = False
             stop_motor(roll_pwm)
-            roll_pid_integral   = 0.0
-            roll_pid_last_error = 0.0
+            roll_pid_integral    = 0.0
+            roll_pid_last_error  = 0.0
+            roll_pid_last_actual = None
             angle = read_roll_angle_deg()
             if angle is not None:
-                _, joy_now          = read_imu_commands()
-                ema_joy_roll        = joy_now
-                roll_home_deg       = angle - (joy_now * ROLL_MAX_DEGREES)
-                roll_target_deg     = angle
-                roll_pid_last_error = 0.0
+                _, joy_now      = read_imu_commands()
+                ema_joy_roll    = joy_now
+                roll_home_deg   = angle - (joy_now * ROLL_MAX_DEGREES)
+                roll_target_deg = angle
         else:
             roll_current_freq = set_motor(roll_pwm, roll_dir, ROLL_INVERT_DIR,
                                           roll_current_freq, roll_last_forward, prev)
@@ -633,10 +752,42 @@ def debug_print(pitch_target, pitch_actual, roll_target, roll_actual, linear_act
     lin_act_str = "{:5.1f}mm".format(linear_actual_mm) if linear_actual_mm is not None else " ?.?mm"
     print("| {}PITCH:{} Tgt:{:5.1f} Act:{:5.1f} Err:{:4.1f}"
           " | {}ROLL:{} Tgt:{:5.1f} Act:{:5.1f} Err:{:4.1f}"
-          " | {}LINEAR:{} Cmd:{:5.1f}mm Act:{} / {:.0f}mm".format(
+          " | {}LINEAR:{} Cmd:{:5.1f}mm Act:{} / {:.0f}mm"
+          " | TRIM: P:{:5.2f} R:{:5.2f}"
+          " | FREQ: P:{} R:{} L:{}".format(
               BOLD, RESET, pitch_target, pitch_actual, pitch_target - pitch_actual,
               BOLD, RESET, roll_target,  roll_actual,  roll_target  - roll_actual,
-              BOLD, RESET, linear_cmd_mm, lin_act_str, LINEAR_MAX_MM))
+              BOLD, RESET, linear_cmd_mm, lin_act_str, LINEAR_MAX_MM,
+              _last_trim_p, _last_trim_r,
+              pitch_current_freq, roll_current_freq, linear_current_freq))
+
+
+def print_input_debug():
+    """
+    Diagnostic: print exactly what the ESP32 reads from its input devices,
+    independent of any control logic. Throttled to 10 Hz.
+
+    rawX/rawY are the unprocessed 12-bit ADC readings (0-4095) from the trim
+    joystick pins. If these don't change when you move the stick, the problem
+    is wiring (pin, VCC, or GND) — not code. sclX/sclY are the deadbanded,
+    normalised [-1,1] values the jog logic actually uses. IMU p/r are the
+    raw tilt angles in degrees.
+    """
+    global input_debug_last_ms
+    now = time.ticks_ms()
+    if time.ticks_diff(now, input_debug_last_ms) < 100:
+        return
+    input_debug_last_ms = now
+    raw_x = sum(trim_joy_x.read() for _ in range(4)) // 4
+    raw_y = sum(trim_joy_y.read() for _ in range(4)) // 4
+    scl_x = _read_trim(trim_joy_x, TRIM_JOY_INVERT_X)
+    scl_y = _read_trim(trim_joy_y, TRIM_JOY_INVERT_Y)
+    imu_p, imu_r = read_imu_angles()
+    imu_p = imu_p if imu_p is not None else 0.0
+    imu_r = imu_r if imu_r is not None else 0.0
+    print("INPUT | TRIM rawX:{:4d} rawY:{:4d} sclX:{:+.2f} sclY:{:+.2f}"
+          " | IMU p:{:+6.1f} r:{:+6.1f}".format(
+              raw_x, raw_y, scl_x, scl_y, imu_p, imu_r))
 
 
 # =============================================================================
@@ -681,10 +832,19 @@ def handle_encoder_linear():
     # ------------------------------------------------------------------
     # 1. Snapshot and reset the encoder counter.
     # ------------------------------------------------------------------
-    irq_state = micropython.disable_irq()
+    irq_state = disable_irq()
     delta = encoder_count
     encoder_count = 0
-    micropython.enable_irq(irq_state)
+    enable_irq(irq_state)
+
+    if axis_fault["linear"]:
+        # Extend-limit crash fault is latched — hold position, drop any encoder
+        # input accumulated while faulted (drained above, so it can't spike the
+        # freq calc on the tick after RE-ARM clears it).
+        stop_linear_motor()
+        linear_current_freq = 0
+        linear_decelerating = False
+        return
 
     # Normalise so positive delta always means "extend" intent.
     if LINEAR_ENCODER_INVERT:
@@ -783,8 +943,8 @@ def handle_encoder_linear():
 def _run_pid(dt_ms):
     """Drive pitch and roll toward pitch_target_deg / roll_target_deg via PID."""
     global pitch_current_freq, roll_current_freq
-    global pitch_pid_integral, pitch_pid_last_error
-    global roll_pid_integral, roll_pid_last_error
+    global pitch_pid_integral, pitch_pid_last_error, pitch_pid_last_actual
+    global roll_pid_integral, roll_pid_last_error, roll_pid_last_actual
 
     dt_sec = max(dt_ms / 1000.0, 0.001)
 
@@ -800,32 +960,43 @@ def _run_pid(dt_ms):
         print("WARNING: Pitch AS5600 read failed. Check wiring.")
         return
 
-    error_pitch = wrap_angle_error(pitch_target_deg - actual_pitch)
-
-    if abs(error_pitch) <= PITCH_POSITION_DEADBAND_DEG:
+    if axis_fault["pitch"]:
+        # Min/max limit crash fault is latched — hold position, skip PID
+        # entirely until RE-ARM clears it (see clear_axis_faults()).
         stop_motor(pitch_pwm)
-        pitch_current_freq   = 0
-        pitch_pid_integral   = 0.0
-        pitch_pid_last_error = error_pitch
+        pitch_current_freq = 0
     else:
-        p_term = PITCH_KP * error_pitch
-        pitch_pid_integral   = max(-PITCH_KI_CLAMP,
-                                   min(PITCH_KI_CLAMP, pitch_pid_integral + error_pitch * dt_sec))
-        i_term = PITCH_KI * pitch_pid_integral
-        d_term = PITCH_KD * (error_pitch - pitch_pid_last_error) / dt_sec
-        pitch_pid_last_error = error_pitch
+        error_pitch = wrap_angle_error(pitch_target_deg - actual_pitch)
 
-        pid_output         = p_term + i_term + d_term
-        desired_freq_pitch = min(int(abs(pid_output)), PITCH_MAX_FREQ)
-        forward_pitch      = pid_output > 0
-        prev_pitch         = pitch_current_freq
-
-        if desired_freq_pitch <= MIN_FREQ:
+        if abs(error_pitch) <= PITCH_POSITION_DEADBAND_DEG:
             stop_motor(pitch_pwm)
-            pitch_current_freq = 0
+            pitch_current_freq    = 0
+            pitch_pid_integral    = 0.0
+            pitch_pid_last_error  = error_pitch
+            pitch_pid_last_actual = actual_pitch
         else:
-            pitch_current_freq = set_motor(pitch_pwm, pitch_dir, PITCH_INVERT_DIR,
-                                           desired_freq_pitch, forward_pitch, prev_pitch)
+            p_term = PITCH_KP * error_pitch
+            pitch_pid_integral   = max(-PITCH_KI_CLAMP,
+                                       min(PITCH_KI_CLAMP, pitch_pid_integral + error_pitch * dt_sec))
+            i_term = PITCH_KI * pitch_pid_integral
+            if pitch_pid_last_actual is None:
+                d_term = 0.0
+            else:
+                d_term = -PITCH_KD * (actual_pitch - pitch_pid_last_actual) / dt_sec
+            pitch_pid_last_error  = error_pitch
+            pitch_pid_last_actual = actual_pitch
+
+            pid_output         = p_term + i_term + d_term
+            desired_freq_pitch = min(int(abs(pid_output)), PITCH_MAX_FREQ)
+            forward_pitch      = pid_output > 0
+            prev_pitch         = pitch_current_freq
+
+            if desired_freq_pitch <= MIN_FREQ:
+                stop_motor(pitch_pwm)
+                pitch_current_freq = 0
+            else:
+                pitch_current_freq = set_motor(pitch_pwm, pitch_dir, PITCH_INVERT_DIR,
+                                               desired_freq_pitch, forward_pitch, prev_pitch)
 
     # -------------------------------------------------------------------------
     # ROLL
@@ -839,32 +1010,43 @@ def _run_pid(dt_ms):
         print("WARNING: Roll AS5600 read failed. Check wiring.")
         return
 
-    error_roll = wrap_angle_error(roll_target_deg - actual_roll)
-
-    if abs(error_roll) <= ROLL_POSITION_DEADBAND:
+    if axis_fault["roll"]:
+        # Min/max limit crash fault is latched — hold position, skip PID
+        # entirely until RE-ARM clears it (see clear_axis_faults()).
         stop_motor(roll_pwm)
-        roll_current_freq   = 0
-        roll_pid_integral   = 0.0
-        roll_pid_last_error = error_roll
+        roll_current_freq = 0
     else:
-        p_term = ROLL_KP * error_roll
-        roll_pid_integral   = max(-ROLL_KI_CLAMP,
-                                  min(ROLL_KI_CLAMP, roll_pid_integral + error_roll * dt_sec))
-        i_term = ROLL_KI * roll_pid_integral
-        d_term = ROLL_KD * (error_roll - roll_pid_last_error) / dt_sec
-        roll_pid_last_error = error_roll
+        error_roll = wrap_angle_error(roll_target_deg - actual_roll)
 
-        pid_output        = p_term + i_term + d_term
-        desired_freq_roll = min(int(abs(pid_output)), ROLL_MAX_FREQ)
-        forward_roll      = pid_output > 0
-        prev_roll         = roll_current_freq
-
-        if desired_freq_roll <= MIN_FREQ:
+        if abs(error_roll) <= ROLL_POSITION_DEADBAND:
             stop_motor(roll_pwm)
-            roll_current_freq = 0
+            roll_current_freq    = 0
+            roll_pid_integral    = 0.0
+            roll_pid_last_error  = error_roll
+            roll_pid_last_actual = actual_roll
         else:
-            roll_current_freq = set_motor(roll_pwm, roll_dir, ROLL_INVERT_DIR,
-                                          desired_freq_roll, forward_roll, prev_roll)
+            p_term = ROLL_KP * error_roll
+            roll_pid_integral   = max(-ROLL_KI_CLAMP,
+                                      min(ROLL_KI_CLAMP, roll_pid_integral + error_roll * dt_sec))
+            i_term = ROLL_KI * roll_pid_integral
+            if roll_pid_last_actual is None:
+                d_term = 0.0
+            else:
+                d_term = -ROLL_KD * (actual_roll - roll_pid_last_actual) / dt_sec
+            roll_pid_last_error  = error_roll
+            roll_pid_last_actual = actual_roll
+
+            pid_output        = p_term + i_term + d_term
+            desired_freq_roll = min(int(abs(pid_output)), ROLL_MAX_FREQ)
+            forward_roll      = pid_output > 0
+            prev_roll         = roll_current_freq
+
+            if desired_freq_roll <= MIN_FREQ:
+                stop_motor(roll_pwm)
+                roll_current_freq = 0
+            else:
+                roll_current_freq = set_motor(roll_pwm, roll_dir, ROLL_INVERT_DIR,
+                                              desired_freq_roll, forward_roll, prev_roll)
 
     debug_print(pitch_target_deg, actual_pitch, roll_target_deg, actual_roll, _linear_actual_mm)
 
@@ -891,62 +1073,69 @@ def handle_main_input(dt_ms):
 # DEMO MODE — preprogrammed motion sequence
 # =============================================================================
 #
-# Sequence: pitch +/- sweep → roll +/- sweep → circular orbit → repeat.
-# The reference point is pitch_home_deg / roll_home_deg, which the arm sets
-# at startup from wherever it physically sits. Jog to the desired filming
-# position with the trim joystick BEFORE enabling DEMO_MODE in config.py.
+# Sequence: brief hold at center → continuous circular orbit (forever).
+# The reference point is pitch_home_deg / roll_home_deg, set at startup from
+# wherever the arm physically sits (jog to position before pressing RE-ARM).
 #
 # Orbit math: a parametric circle in pitch/roll space.
-#   pitch = home + radius * cos(ω * t)
-#   roll  = home + radius * sin(ω * t)
-# At t=0: pitch = home + radius, roll = home — exactly where the orbit-entry
-# phase (phase 8) already commanded, so the transition is seamless.
+#   pitch = home + r_eff * cos(ω * t)
+#   roll  = home + r_eff * sin(ω * t)
+# The orbit phase is TERMINAL — once entered it loops on itself indefinitely.
+# A sinusoid is inherently seamless, so there is no visible "restart." The
+# radius r_eff ramps from 0 → DEMO_ORBIT_RADIUS_DEG over the first revolution
+# (a one-time spiral-out), so entry starts exactly at the center with no step.
 
 _demo_phase          = 0
 _demo_phase_start_ms = 0
 
 # Each entry is (pitch_offset_deg, roll_offset_deg) from home, or None for orbit.
 _DEMO_PHASES = [
-    (0, 0), # 0: hold at home — jog to desired orbit center with trim stick
-    None,   # 1: circular orbit — loops continuously
+    (0, 0), # 0: hold at center — one-time dwell; trim stick shifts center
+    None,   # 1: circular orbit — terminal, loops continuously and seamlessly
 ]
 
 
 def handle_demo(dt_ms):
     global pitch_target_deg, roll_target_deg, pitch_home_deg, roll_home_deg
     global _demo_phase, _demo_phase_start_ms
+    global _last_trim_p, _last_trim_r
 
-    now            = time.ticks_ms()
-    elapsed        = time.ticks_diff(now, _demo_phase_start_ms)
-    phase_duration = DEMO_ORBIT_DURATION_MS if _DEMO_PHASES[_demo_phase] is None else DEMO_HOLD_MS
-
-    if elapsed >= phase_duration:
-        _demo_phase = (_demo_phase + 1) % len(_DEMO_PHASES)
-        _demo_phase_start_ms = now
-        elapsed = 0
-        if _demo_phase == 0:
-            print("Demo: restarting sequence.")
-
-    # Trim joystick shifts the orbit center live during demo.
-    # Uses dedicated (slower) demo trim speeds — regular jog speeds are far too fast
-    # for fine orbit-center positioning.
-    trim_p = _read_trim(trim_joy_x, TRIM_JOY_INVERT_X)
-    trim_r = _read_trim(trim_joy_y, TRIM_JOY_INVERT_Y)
-    if trim_p != 0.0:
-        pitch_home_deg += trim_p * DEMO_TRIM_PITCH_RPS * 360.0 * dt_ms / 1000.0
-    if trim_r != 0.0:
-        roll_home_deg  += trim_r * DEMO_TRIM_ROLL_RPS  * 360.0 * dt_ms / 1000.0
-
+    now     = time.ticks_ms()
+    elapsed = time.ticks_diff(now, _demo_phase_start_ms)
     offsets = _DEMO_PHASES[_demo_phase]
 
+    # Advance ONLY from the initial hold into the orbit, once. The orbit phase
+    # is terminal: it never transitions back, so the demo loops seamlessly with
+    # no visible restart.
+    if offsets is not None and elapsed >= DEMO_HOLD_MS:
+        _demo_phase          = 1
+        _demo_phase_start_ms = now
+        elapsed              = 0
+        offsets              = _DEMO_PHASES[1]
+
+    trim_p = _read_trim(trim_joy_x, TRIM_JOY_INVERT_X)
+    trim_r = _read_trim(trim_joy_y, TRIM_JOY_INVERT_Y)
+    _last_trim_p = trim_p
+    _last_trim_r = trim_r
+
     if offsets is not None:
+        # Hold phase: trim shifts the orbit center.
+        if trim_p != 0.0:
+            pitch_home_deg += trim_p * DEMO_TRIM_PITCH_RPS * 360.0 * dt_ms / 1000.0
+        if trim_r != 0.0:
+            roll_home_deg  += trim_r * DEMO_TRIM_ROLL_RPS  * 360.0 * dt_ms / 1000.0
         pitch_target_deg = pitch_home_deg + offsets[0]
         roll_target_deg  = roll_home_deg  + offsets[1]
     else:
-        t     = elapsed / 1000.0
-        omega = DEMO_ORBIT_RPS * 2.0 * math.pi
-        pitch_target_deg = pitch_home_deg + DEMO_ORBIT_RADIUS_DEG * math.cos(omega * t)
-        roll_target_deg  = roll_home_deg  + DEMO_ORBIT_RADIUS_DEG * math.sin(omega * t)
+        # Orbit phase: continuous. Ramp radius 0→R over the first revolution so
+        # entry starts at the center (no step), then full radius forever.
+        # elapsed never resets here, so the ramp happens exactly once.
+        t      = elapsed / 1000.0
+        omega  = DEMO_ORBIT_RPS * 2.0 * math.pi
+        ramp_s = 1.0 / DEMO_ORBIT_RPS                       # one orbit period
+        r_eff  = DEMO_ORBIT_RADIUS_DEG * min(1.0, t / ramp_s)
+        pitch_target_deg = pitch_home_deg + r_eff * math.cos(omega * t)
+        roll_target_deg  = roll_home_deg  + r_eff * math.sin(omega * t)
 
     _run_pid(dt_ms)
 
@@ -958,8 +1147,8 @@ def handle_demo(dt_ms):
 def main():
     global last_tick_ms, roll_home_deg, roll_target_deg, ema_joy_roll
     global pitch_home_deg, pitch_target_deg, ema_joy_pitch
-    global roll_pid_integral, roll_pid_last_error
-    global pitch_pid_integral, pitch_pid_last_error
+    global roll_pid_integral, roll_pid_last_error, roll_pid_last_actual
+    global pitch_pid_integral, pitch_pid_last_error, pitch_pid_last_actual
     global linear_is_homed
     global estop_active, estop_handled
     global pitch_current_freq, roll_current_freq, linear_current_freq
@@ -979,6 +1168,25 @@ def main():
     tca_select(LINEAR_TCA_CHANNEL)
     devices = i2c.scan()
     print("  Linear channel (expect 0x36):    ", [hex(d) for d in devices])
+
+    # Read-based health check: a scan only proves the address ACKs. Actually read
+    # the raw angle register from each channel to confirm the register read works
+    # (different I2C transaction). FAIL here but ACK above = wiring/intermittent.
+    print("I2C read check (raw angle register, expect 0-4095):")
+    for _name, _ch in (("Roll  ", ROLL_TCA_CHANNEL),
+                       ("Pitch ", PITCH_TCA_CHANNEL),
+                       ("Linear", LINEAR_TCA_CHANNEL)):
+        _raw = _read_as5600_raw(_ch)
+        print("  {} ch{}: {}".format(_name, _ch,
+              "FAIL (register read returned None)" if _raw is None else _raw))
+
+    try:
+        _mcp_boot_bits = mcp.read_gpio()
+        print("MCP23017 (0x{:02X}) PA0-5: {} (1 = triggered; expect 000000 at rest)".format(
+            MCP23017_ADDR, "".join(str((_mcp_boot_bits >> b) & 1) for b in range(5, -1, -1))))
+    except OSError:
+        print("WARNING: MCP23017 not responding at 0x{:02X}. Check wiring — limit switches disabled.".format(
+            MCP23017_ADDR))
 
     print("Robot arm controller starting.")
     print("--- Derived config ---")
@@ -1009,7 +1217,7 @@ def main():
     initial_pitch_angle = read_pitch_angle_deg()
     if initial_pitch_angle is None:
         print("ERROR: Could not read pitch AS5600.")
-        print("Check: VCC->3.3V, GND->GND, SDA->GPIO4, SCL->GPIO5.")
+        print("Check: VCC->3.3V, GND->GND, SDA->GPIO21, SCL->GPIO22.")
         print("Confirm magnet is within ~3mm of sensor face.")
         return
 
@@ -1032,60 +1240,127 @@ def main():
     ema_joy_roll         = initial_joy_roll
     roll_pid_integral    = 0.0
     roll_pid_last_error  = 0.0
+    roll_pid_last_actual = None
     print("Roll encoder OK. Roll home: {:.2f} deg".format(initial_angle))
 
-    pitch_home_deg       = initial_pitch_angle - (initial_joy_pitch * PITCH_MAX_DEGREES)
-    pitch_target_deg     = initial_pitch_angle
-    ema_joy_pitch        = initial_joy_pitch
-    pitch_pid_integral   = 0.0
-    pitch_pid_last_error = 0.0
+    pitch_home_deg        = initial_pitch_angle - (initial_joy_pitch * PITCH_MAX_DEGREES)
+    pitch_target_deg      = initial_pitch_angle
+    ema_joy_pitch         = initial_joy_pitch
+    pitch_pid_integral    = 0.0
+    pitch_pid_last_error  = 0.0
+    pitch_pid_last_actual = None
     print("Pitch encoder OK. Pitch home: {:.2f} deg".format(initial_pitch_angle))
 
     # --- Linear homing (automatic) ---
-    if estop_pin.value() == 1:
-        estop_active  = True
-        estop_handled = False
-        print("WARNING: E-stop is active at startup. Release e-stop and press RE-ARM before homing.")
-
-    print("")
-    _boot_btn = Pin(0, Pin.IN, Pin.PULL_UP)
-    print("Homing linear axis in 3s — press BOOT button or any key + Enter to skip...")
-    skip_homing = False
-    for _ in range(30):
-        if _boot_btn.value() == 0:
-            skip_homing = True
-            break
-        if select.select([sys.stdin], [], [], 0)[0]:
-            sys.stdin.read(1)
-            skip_homing = True
-            break
-        time.sleep_ms(100)
-
-    if skip_homing:
-        for _ in range(2):
-            _status_led.value(1)
-            time.sleep_ms(150)
-            _status_led.value(0)
-            time.sleep_ms(150)
-        print("Homing skipped. Position tracking starts from 0.")
-    elif estop_active:
-        print("Homing skipped — E-STOP active. Release e-stop and re-arm before using linear axis.")
+    # Skipped entirely in demo mode: the demo orbit only moves pitch/roll, and
+    # handle_encoder_linear() is disabled in demo (stepper EMI). Homing would
+    # just drive the carriage at homing speed toward the limit switch for no
+    # reason — and if the switch isn't wired/triggering, it drives to end-of-ROM.
+    if DEMO_MODE:
+        print("Demo mode — skipping linear homing (linear axis is not used in the demo).")
     else:
-        print("Homing linear axis automatically...")
-        home_linear_axis()
+        if estop_pin.value() == 1:
+            estop_active  = True
+            estop_handled = False
+            print("WARNING: E-stop is active at startup. Release e-stop and press RE-ARM before homing.")
+
+        print("")
+        _boot_btn = Pin(0, Pin.IN, Pin.PULL_UP)
+        print("Homing linear axis in 3s — press BOOT button or any key + Enter to skip...")
+        skip_homing = False
+        for _ in range(30):
+            if _boot_btn.value() == 0:
+                skip_homing = True
+                break
+            if select.select([sys.stdin], [], [], 0)[0]:
+                sys.stdin.read(1)
+                skip_homing = True
+                break
+            time.sleep_ms(100)
+
+        if skip_homing:
+            for _ in range(2):
+                _status_led.value(1)
+                time.sleep_ms(150)
+                _status_led.value(0)
+                time.sleep_ms(150)
+            print("Homing skipped. Position tracking starts from 0.")
+        elif estop_active:
+            print("Homing skipped — E-STOP active. Release e-stop and re-arm before using linear axis.")
+        else:
+            print("Homing linear axis automatically...")
+            home_linear_axis()
 
     print("")
     if DEMO_MODE:
-        print("{}DEMO MODE ACTIVE{} — running preprogrammed sequence.".format(BOLD, RESET))
-        print("Jog to filming position with trim joystick, then reset to start demo.\n")
-        # In demo mode the IMU is never read, so the IMU-offset baked into
-        # pitch/roll_home_deg is meaningless and shifts the orbit center away from
-        # the arm's actual position. Override to use raw encoder positions so the
-        # orbit is centered exactly where the arm physically is at boot.
-        pitch_home_deg       = initial_pitch_angle
-        roll_home_deg        = initial_angle
-        pitch_target_deg     = initial_pitch_angle
-        roll_target_deg      = initial_angle
+        print("{}DEMO MODE ACTIVE{}\n".format(BOLD, RESET))
+        # Seed from raw encoder position so orbit center starts at arm's actual position.
+        pitch_home_deg   = initial_pitch_angle
+        roll_home_deg    = initial_angle
+        pitch_target_deg = initial_pitch_angle
+        roll_target_deg  = initial_angle
+
+        # Pre-demo jog: hold here until user positions arm and presses RE-ARM.
+        print("  Jog arm to desired orbit center with trim joystick.")
+        print("  Press RE-ARM button (GPIO5) when ready.\n")
+        _pre_tick_ms = time.ticks_ms()
+        while True:
+            _loop_start  = time.ticks_ms()
+            _dt          = time.ticks_diff(_loop_start, _pre_tick_ms)
+            _pre_tick_ms = _loop_start
+
+            if not rearm_pin.value():
+                break
+            if select.select([sys.stdin], [], [], 0)[0]:
+                sys.stdin.read(1)
+                break
+
+            _linear_actual_mm = update_linear_encoder_mm()  # keep linear live before re-arm
+            print_input_debug()   # so the visualizer shows live joystick state here
+            read_limit_switches()  # pitch/roll crash switches are live even during pre-demo jog
+
+            if not estop_active:
+                trim_p = _read_trim(trim_joy_x, TRIM_JOY_INVERT_X)
+                trim_r = _read_trim(trim_joy_y, TRIM_JOY_INVERT_Y)
+                any_jog = (trim_p != 0.0 or trim_r != 0.0
+                           or pitch_decelerating or roll_decelerating)
+                if any_jog:
+                    handle_jogging(trim_p, trim_r)
+                else:
+                    _run_pid(_dt)
+            else:
+                stop_motor(pitch_pwm)
+                stop_motor(roll_pwm)
+
+            _elapsed = time.ticks_diff(time.ticks_ms(), _loop_start)
+            _sleep   = CONTROL_LOOP_MS - _elapsed
+            if _sleep > 0:
+                time.sleep_ms(_sleep)
+
+        # Latch actual encoder position as orbit center; clear all jog momentum.
+        _p = read_pitch_angle_deg()
+        _r = read_roll_angle_deg()
+        if _p is not None:
+            pitch_home_deg = _p
+        if _r is not None:
+            roll_home_deg  = _r
+        pitch_target_deg      = pitch_home_deg
+        roll_target_deg       = roll_home_deg
+        pitch_pid_integral    = 0.0
+        pitch_pid_last_error  = 0.0
+        pitch_pid_last_actual = None
+        roll_pid_integral     = 0.0
+        roll_pid_last_error   = 0.0
+        roll_pid_last_actual  = None
+        pitch_current_freq    = 0
+        roll_current_freq     = 0
+        pitch_decelerating    = False
+        roll_decelerating     = False
+        stop_motor(pitch_pwm)
+        stop_motor(roll_pwm)
+
+        print("\nRE-ARM pressed — demo starting. Orbit center: pitch={:.1f}°  roll={:.1f}°".format(
+            pitch_home_deg, roll_home_deg))
         _demo_phase          = 0
         _demo_phase_start_ms = time.ticks_ms()
     else:
@@ -1125,15 +1400,17 @@ def main():
                     r_angle = read_roll_angle_deg()
                     _p, _r = read_imu_commands()
                     if p_angle is not None:
-                        ema_joy_pitch        = _p
-                        pitch_home_deg       = p_angle - (_p * PITCH_MAX_DEGREES)
-                        pitch_target_deg     = p_angle
-                        pitch_pid_last_error = 0.0
+                        ema_joy_pitch         = _p
+                        pitch_home_deg        = p_angle - (_p * PITCH_MAX_DEGREES)
+                        pitch_target_deg      = p_angle
+                        pitch_pid_last_error  = 0.0
+                        pitch_pid_last_actual = None
                     if r_angle is not None:
-                        ema_joy_roll         = _r
-                        roll_home_deg        = r_angle - (_r * ROLL_MAX_DEGREES)
-                        roll_target_deg      = r_angle
-                        roll_pid_last_error  = 0.0
+                        ema_joy_roll          = _r
+                        roll_home_deg         = r_angle - (_r * ROLL_MAX_DEGREES)
+                        roll_target_deg       = r_angle
+                        roll_pid_last_error   = 0.0
+                        roll_pid_last_actual  = None
                     pitch_pid_integral   = 0.0
                     roll_pid_integral    = 0.0
                     pitch_decelerating   = False
@@ -1152,6 +1429,11 @@ def main():
                 time.sleep_ms(sleep_ms)
             continue
 
+        # --- Axis crash/limit switches ---
+        read_limit_switches()
+        if any(axis_fault.values()) and not rearm_pin.value():
+            clear_axis_faults()
+
         if DEMO_MODE:
             handle_demo(dt_ms)
         else:
@@ -1166,8 +1448,10 @@ def main():
             else:
                 handle_main_input(dt_ms)
 
-        handle_encoder_linear()   # always runs, independent of jog state
+        if not DEMO_MODE:
+            handle_encoder_linear()   # skip in demo — stepper EMI drives phantom counts
         _linear_actual_mm = update_linear_encoder_mm()
+        print_input_debug()   # raw + scaled joystick / IMU for the visualizer input panel
         _status_led.value((time.ticks_ms() // 1000) % 2)
 
         elapsed  = time.ticks_diff(time.ticks_ms(), loop_start)

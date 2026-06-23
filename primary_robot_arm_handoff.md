@@ -43,9 +43,9 @@ All 38 ESP32 pins are now fully committed. Do not reassign without a full audit.
 | 18 | Unused (was Pitch rocker FWD) |
 | 19 | Unused (was Pitch rocker BWD) |
 | 23 | Linear limit switch (INPUT_PULLUP, normally closed — reads 0 at rest, 1 when triggered) |
-| 21 | I2C SDA — shared bus: TCA9548A (→ both AS5600s) + MPU6050 IMU |
-| 22 | I2C SCL — shared bus: TCA9548A (→ both AS5600s) + MPU6050 IMU |
-| 4  | E-stop button (NC, INPUT_PULLUP — open = triggered, fail-safe wiring) |
+| 21 | I2C SDA — shared bus: TCA9548A (→ both AS5600s) + MPU6050 IMU. One 2.2kΩ pull-up to 3.3V (see §5.2). |
+| 22 | I2C SCL — shared bus: TCA9548A (→ both AS5600s) + MPU6050 IMU. One 2.2kΩ pull-up to 3.3V (see §5.2). |
+| 4  | E-stop button (NC, INPUT_PULLUP — open = triggered, fail-safe wiring). 100nF cap GPIO4→GND for EMI/glitch filtering (see ISR comment in armcontrol.py). |
 | 5  | Re-arm button (NO, INPUT_PULLUP — press after releasing e-stop to resume) |
 | 2  | Onboard blue LED (OUTPUT — blinks 1Hz while armcontrol.py main loop is running) |
 | 0  | BOOT button — used by boot.py for standalone launch; also skips linear homing in armcontrol.py |
@@ -140,10 +140,10 @@ In the code: limit_switch_triggered() returns True when linear_limit.value() == 
 
 Both AS5600 encoders share a single SoftI2C bus (GPIO 21/22) via a **TCA9548A I2C multiplexer** (address 0x70). The TCA9548A selects which AS5600 is active before each read — Roll on channel 0, Pitch on channel 1. This replaced the earlier two-bus approach (GPIO 4/5 and 21/22) to free up GPIO 4/5 for the e-stop and re-arm buttons.
 
-The bus is configured at 100kHz.
+The bus is configured at 50kHz.
 
-- **Why 100kHz:** The encoder signals run over extended cable runs. At 400kHz, high cable capacitance rounds the signal edges and causes read failures. 100kHz gives the edges more time to settle. If reads fail again after a cable change, try dropping to 50kHz before investigating other causes.
-- **Pull-up resistors:** The AS5600 breakout boards likely have 10kΩ pull-ups. For long cable runs, adding 2.2kΩ or 1kΩ pull-ups from SDA/SCL to 3.3V at the ESP32 end can significantly improve reliability. Try this before reducing frequency further.
+- **Why 50kHz:** The encoder signals run over extended cable runs. At 400kHz, high cable capacitance rounds the signal edges and causes read failures. 100kHz was tried first but dropped to 50kHz for extra rise-time margin — only a couple registers are read at ~10-25Hz, so the lower clock costs nothing.
+- **Pull-up resistors (confirmed installed):** One 2.2kΩ resistor from SDA (GPIO21) to the 3.3V rail, and one 2.2kΩ from SCL (GPIO22) to 3.3V — a single pair for the whole shared bus. Two 4-wire cables (TCA9548A/AS5600 board, and the MPU6050 IMU — see §5.3) feed into screw-terminal blocks on the breadboard, breaking out to 3V/GND/SDA/SCL rails; SDA from both cables jumpers onto GPIO21, SCL from both onto GPIO22, confirming this is genuinely one shared bus rather than two. Earlier wiring had a 2.2kΩ resistor on each cable's SDA/SCL rail before they were jumpered together, putting two 2.2kΩ resistors in parallel per line (≈1.1kΩ effective) — redundant since both resistors terminated at the same node. Removed the duplicates; one 2.2kΩ per line is correct and matches `esp32_pinout.md` §1.2.
 - **Minimum safe I2C frequency:** ~50kHz. Below this, AS5600 internal timeout behaviour becomes unpredictable. Do not go below 10kHz under any circumstance.
 - **Ethernet cable warning:** Ethernet cable is not suitable for I2C over distance. Its high inter-conductor capacitance rounds signal edges. Use shielded twisted pair (STP) cable, or consider I2C bus extender chips (PCA9600, LTC4311) for runs longer than ~0.5m.
 - **Intermittent read failures:** Three Roll AS5600 read failures were observed in a single test session, likely vibration-induced contact issues on the cable to the TCA9548A. Each failure stops the roll motor for one tick. Check all connectors under the multiplexer if failures recur.
@@ -156,7 +156,7 @@ The MPU6050 (GY-521 breakout) replaced the analog joystick as the pitch/roll inp
 
 **I2C bus sharing:** The MPU6050 sits directly on the same bus as the TCA9548A (0x70). No mux needed — its address (0x68) doesn't collide with anything on the bus. The physical wires that previously carried the joystick analog signals (through the control station ethernet cable) now carry this I2C bus to the IMU.
 
-**Pull-up resistors:** 2.2kΩ–1kΩ pull-ups on SDA and SCL at the ESP32 end are recommended for the long cable run from control station to ESP32. The GY-521 has onboard 10kΩ pull-ups, but these are too weak over extended cable. Standard 100kHz bus speed.
+**Pull-up resistors:** Shares the single 2.2kΩ SDA / 2.2kΩ SCL pull-up pair described in §5.2 — no separate pull-ups for the IMU cable. The GY-521 has onboard 10kΩ pull-ups, but these are too weak over the extended cable run alone, which is why the bus-level 2.2kΩ pair was added at the ESP32 end.
 
 **How angle derivation works:** The code uses only the accelerometer — not the gyroscope. It computes pitch and roll from the gravity vector direction using `atan2`. This gives absolute, gravity-referenced angles that do not drift over time. The gyroscope is not used. During fast motion, accelerometer noise increases; the EMA filter (EMA_ALPHA) mitigates this.
 
@@ -218,7 +218,7 @@ The linear axis is open-loop and rocker-only. The only parameters to tune are:
 - **PID tuning incomplete:** ROLL_KP reduced from 200 → 50 to fix sign-flip bouncing. Further tuning needed. See Section 6.1.
 - **Intermittent Roll AS5600 read failures:** Seen in testing, likely vibration-induced connector issue. Each failure causes a 1-tick motor stop.
 - **No hard stop protection at BWD high speed:** The limit switch causes an immediate hard stop rather than a decel ramp. At current speeds this is fine; consider decel-on-limit if speed is increased.
-- **I2C cable runs:** Ethernet cable was tried and failed. Currently on shorter runs at 100kHz. Proper shielded cable and/or I2C bus extenders recommended for any future cable lengthening.
+- **I2C cable runs:** Ethernet cable was tried and failed. Currently on shorter runs at 50kHz. Proper shielded cable and/or I2C bus extenders recommended for any future cable lengthening.
 - **No motor enable pin control:** Driver ENA pins are not wired to GPIO. A hard reset leaves motors running until Ctrl+C or REPL cleanup.
 
 ---
