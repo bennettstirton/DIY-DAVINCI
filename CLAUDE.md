@@ -13,6 +13,7 @@ DIY 3-axis robot arm controlled by an ESP32 running MicroPython. Used in a surgi
 | `pitch_sweep.py` | One-off **open-loop pitch motor-adequacy test** (ESP32). Hand-calibrates ROM, then sweeps pitch at constant step rate (no PID) so missed steps/stall = torque limit. Flashed via `sweep-deploy`. |
 | `pitch_trace.py` | Older Mac-side pitch/roll-only scrolling trace (not launched by deploy) |
 | `arm_visualizer.py` | **DEPRECATED** 3D digital-twin visualizer — no longer used, kept for reference only |
+| `armcontrol_refactor_plan.md` | **Planned** structural refactor of `armcontrol.py` (split into `sensors.py`/`motors.py`, then an `Axis` class). Behavior-preserving, do before the demo sprint. Not started. |
 | `primary_robot_arm_handoff.md` | Full architecture, hardware notes, bug history, tuning guide |
 | `secondary_surgical_robot_handoff.md` | Secondary robot handoff doc |
 | `esp32_pinout.md` | **Authoritative pin-level wiring reference**, both ESP32 boards (arm + instrument) — pull-up/cap values, strapping-pin cautions, spare GPIO map |
