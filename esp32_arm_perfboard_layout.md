@@ -86,9 +86,9 @@ polls the chip once per 40ms tick instead of wiring an interrupt.
 | GND | ground | GND rail |
 | SDA | I2C data | ESP32 GPIO21 |
 | SCL | I2C clock | ESP32 GPIO22 |
-| A0 | addr bit 0 | GND rail (tie low → addr 0x20) |
-| A1 | addr bit 1 | GND rail |
-| A2 | addr bit 2 | GND rail |
+| A0 | addr bit 0 | GND rail (tie low → addr 0x20) — **see Waveshare note** |
+| A1 | addr bit 1 | GND rail — **see Waveshare note** |
+| A2 | addr bit 2 | GND rail — **see Waveshare note** |
 | INTA, INTB | interrupt out | not connected |
 | PA0 | linear retract/home limit | limit switch (NC) → GND, remote |
 | PA1 | linear extend limit | limit switch (NC) → GND, remote |
@@ -100,6 +100,24 @@ polls the chip once per 40ms tick instead of wiring an interrupt.
 
 All six switches use the MCP's internal pull-ups (`GPPU` registers set in
 `mcp23017.py`) — no external pull-up resistors needed on the perfboard.
+
+### Waveshare board variant (the board actually in use)
+
+This build uses a **Waveshare MCP23017 board**, not a bare DIP/generic breakout
+(`config.py` confirms it). Two things differ from the generic pinout above:
+
+- **Address pins:** the Waveshare board sets A0/A1/A2 via **onboard jumpers/solder
+  pads**, which default to all-low → **0x20** (exactly what `MCP23017_ADDR`
+  expects). So wires **#17–19 below are optional/redundant** — leave the jumpers
+  at default and you do not need to run A0/A1/A2 to the GND rail at all. Only wire
+  them (or move a jumper) if you're relocating the address off 0x20.
+- **Onboard I2C pull-ups:** some Waveshare units include their own SDA/SCL
+  pull-ups in parallel with the perfboard's 2.2kΩ. That's harmless (slightly
+  stronger total pull-up); only revisit if the bus acts flaky. Verify against the
+  silkscreen, and confirm the screw terminals are labelled PA0–PA5 (some Waveshare
+  boards label them GPA0–GPA5).
+
+Net effect: the host-side connection is **4 wires** (VCC, GND, SDA, SCL), not 7.
 
 ## Full wire list (every on-board solder connection)
 
@@ -121,9 +139,9 @@ All six switches use the MCP's internal pull-ups (`GPPU` registers set in
 | 14 | MCP23017 GND | GND rail | GND | |
 | 15 | MCP23017 SDA | ESP32 GPIO21/SDA (I-right) | I2C | shares the SDA pull-up at #5/#6 |
 | 16 | MCP23017 SCL | ESP32 GPIO22/SCL (F-right) | I2C | shares the SCL pull-up at #3/#4 |
-| 17 | MCP23017 A0 | GND rail | addr | |
-| 18 | MCP23017 A1 | GND rail | addr | |
-| 19 | MCP23017 A2 | GND rail | addr | |
+| 17 | MCP23017 A0 | GND rail | addr | **optional on Waveshare** — onboard jumper defaults low (0x20); skip unless relocating address |
+| 18 | MCP23017 A1 | GND rail | addr | **optional on Waveshare** — see #17 |
+| 19 | MCP23017 A2 | GND rail | addr | **optional on Waveshare** — see #17 |
 
 Everything else is an **external lead** — a wire leaving the board to a
 remote/panel component, not a board-to-board solder joint. See the pin map
@@ -137,7 +155,7 @@ table above for where each one lands.
 4. Socket the TCA9548A breakout at rows T/V. Wire #7–11 (mux power + address tie-low).
 5. Wire #3–6 (I2C bus + pull-ups).
 6. Wire #12 (e-stop debounce cap).
-7. Socket the MCP23017 breakout. Wire #13-19 (power + address tie-low + I2C taps).
+7. Socket the MCP23017 breakout. Wire #13-16 (power + I2C taps). On the Waveshare board, skip #17-19 — leave the address jumpers at default (0x20). On a generic breakout, add #17-19 to tie A0/A1/A2 low.
 8. Land external leads per the pin map: steppers, joystick, encoder, switches, remote sensors. If the hardware e-stop gate is built, route GPIO4/14/26/13 to it per `estop_ic_guide_and_diagram.md` instead of straight to the switch/drivers.
 9. Power up without motor PSU connected first; confirm 3.3V rail voltage and I2C bus scan (TCA9548A + 3× AS5600 + MPU6050 + MCP23017) before connecting drivers. `armcontrol.py` prints a boot-time MCP23017 health check (PA0-5 state) — all six should read `0` at rest.
 
